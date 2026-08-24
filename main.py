@@ -33,7 +33,8 @@ BOT_USERNAME = "@StarPays24_bot"
 REWARD_PER_SUB = 0.25
 UNSUB_PENALTY = 1.0
 MIN_WITHDRAW = 15.0
-DB_PATH = "bot_database.db"
+# Читает путь из переменных Railway. Если её нет (локально) — использует bot_database.db
+DB_PATH = os.getenv("DB_PATH", "/app/data/bot_database.db")
 WITHDRAWS_PER_PAGE = 10
 TOP_USERS_LIMIT = 10
 
