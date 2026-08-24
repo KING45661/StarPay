@@ -501,7 +501,6 @@ async def start_cmd(message: types.Message, command: CommandObject, state: FSMCo
 async def check_already_used_handler(callback: types.CallbackQuery):
     await callback.answer("Этот чек уже был активирован!", show_alert=True)
 
-# ==================== ЕЖЕДНЕВНЫЙ БОНУС ====================
 @dp.message(F.text == "📅 Ежедневный бонус")
 async def daily_bonus_cmd(message: types.Message, state: FSMContext):
     await state.clear()
@@ -509,29 +508,39 @@ async def daily_bonus_cmd(message: types.Message, state: FSMContext):
     now = datetime.now()
 
     async with aiosqlite.connect(DB_PATH) as db:
-        async with db.execute("SELECT last_daily FROM users WHERE user_id = ?", (user_id,)) as cursor:
-            row = await cursor.fetchone()
-            last_daily_str = row[0] if row else None
+        # Ставим таймаут, чтобы SQLite не падал при быстрых кликах
+        db.isolation_level = None  # Включаем автоматическое управление транзакциями
+        
+        async with db.execute("BEGIN IMMEDIATE"):
+            async with db.execute("SELECT last_daily FROM users WHERE user_id = ?", (user_id,)) as cursor:
+                row = await cursor.fetchone()
+                last_daily_str = row[0] if row else None
 
-        if last_daily_str:
-            last_daily = datetime.fromisoformat(last_daily_str)
-            if now < last_daily + timedelta(hours=24):
-                remaining = (last_daily + timedelta(hours=24)) - now
-                hours, remainder = divmod(int(remaining.total_seconds()), 3600)
-                minutes, _ = divmod(remainder, 60)
-                h_esc, m_esc = escape_md(str(hours)), escape_md(str(minutes))
-                await message.answer(f"⏳ *Вы уже получали бонус\!*\nСледующий бонус будет доступен через: *{h_esc} ч\. {m_esc} мин\.*")
-                return
+            if last_daily_str:
+                last_daily = datetime.fromisoformat(last_daily_str)
+                if now < last_daily + timedelta(hours=24):
+                    remaining = (last_daily + timedelta(hours=24)) - now
+                    hours, remainder = divmod(int(remaining.total_seconds()), 3600)
+                    minutes, _ = divmod(remainder, 60)
+                    h_esc, m_esc = escape_md(str(hours)), escape_md(str(minutes))
+                    await message.answer(
+                        f"⏳ *Вы уже получали бонус\!*\n"
+                        f"Следующий бонус будет доступен через: *{h_esc} ч\. {m_esc} мин\.*"
+                    )
+                    return
 
-        bonus_amount = random_daily_bonus()
-        await db.execute("UPDATE users SET balance = balance + ?, last_daily = ? WHERE user_id = ?",
-                         (bonus_amount, now.isoformat(), user_id))
-        await log_balance_change(db, user_id, bonus_amount, "daily")
-        await db.commit()
+            bonus_amount = random_daily_bonus()
+            
+            # Сразу обновляем и дата-штамп, и баланс
+            await db.execute(
+                "UPDATE users SET balance = balance + ?, last_daily = ? WHERE user_id = ?",
+                (bonus_amount, now.isoformat(), user_id)
+            )
+            await log_balance_change(db, user_id, bonus_amount, "daily")
 
+    # Сообщение выводим только ПОСЛЕ успешного закрытия транзакции
     bonus_esc = escape_md(f"{bonus_amount:.1f}")
     await message.answer(f"🎁 *Поздравляем\! Вы получили ежедневный бонус: \+{bonus_esc} ⭐*")
-
 # ==================== ДРУЗЬЯ ====================
 @dp.message(F.text == "👥 Друзья")
 async def friends_cmd(message: types.Message, state: FSMContext):
