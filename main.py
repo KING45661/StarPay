@@ -2074,8 +2074,32 @@ async def delete_channel(callback: types.CallbackQuery):
     await callback.answer("Канал удалён!")
     await callback.message.edit_text("✅ *Канал успешно удалён из системы\.*")
 
+# ==================== ВОССТАНОВЛЕНИЕ ИЗ БЭКАПА ====================
+def restore_from_backup():
+    """Восстанавливает БД из последнего бэкапа если основной файл потерян или пуст"""
+    db_path = Path("/app/data/bot_database.db")
+    backup_dir = Path("/app/backups")
+    
+    # Если БД существует и имеет размер > 0, всё ОК
+    if db_path.exists() and db_path.stat().st_size > 0:
+        logging.info("✅ БД найдена и содержит данные")
+        return
+    
+    # БД потеряна или пуста — ищем последний бэкап
+    if backup_dir.exists():
+        backups = sorted(backup_dir.glob("bot_database_*.db"), reverse=True)
+        if backups:
+            latest_backup = backups[0]
+            logging.info(f"🔄 БД потеряна! Восстанавливаю из бэкапа: {latest_backup.name}")
+            shutil.copy(latest_backup, db_path)
+            logging.info(f"✅ БД восстановлена из бэкапа: {db_path}")
+            return
+    
+    logging.warning("⚠️ Бэкапов не найдено, создаётся новая БД")
+
 # ==================== ЗАПУСК ====================
 async def main():
+    restore_from_backup()
     await init_db()
     asyncio.create_task(backup_db_loop())
     while True:
