@@ -239,6 +239,66 @@ async def backup_db_loop():
 
         await asyncio.sleep(24 * 60 * 60)
 
+
+async def daily_broadcast_loop():
+    # Рассылка: каждый день отправляем пользователям напоминание с кнопкой "Начать фармить"
+    while True:
+        try:
+            async with aiosqlite.connect(DB_PATH) as db:
+                async with db.execute("SELECT user_id FROM users") as cursor:
+                    users = await cursor.fetchall()
+
+            text = (
+                "🌞 *Ежедневное напоминание: время фармить звёзды!*\n\n"
+                "Нажмите кнопку ниже, чтобы начать фармить сейчас:\n"
+                "*/start*"
+            )
+
+            builder = InlineKeyboardBuilder()
+            builder.button(text="Начать фармить", callback_data="daily_start")
+            builder.adjust(1)
+
+            for u in users:
+                u_id = u[0]
+                try:
+                    await bot.send_message(u_id, text, reply_markup=builder.as_markup())
+                    await asyncio.sleep(0.03)
+                except Exception:
+                    continue
+        except Exception as e:
+            logging.error(f"Ошибка daily_broadcast: {e}")
+
+        # Ждём 24 часа
+        await asyncio.sleep(24 * 60 * 60)
+
+
+@dp.callback_query(F.data == "daily_start")
+async def daily_start_handler(callback: types.CallbackQuery):
+    # При нажатии — показываем стартовый экран и отмечаем действие
+    try:
+        await callback.message.delete()
+    except Exception:
+        pass
+    await show_start_screen(callback.message, callback.from_user)
+    await callback.answer()
+
+
+@dp.callback_query(F.data == "check_required_subs")
+async def check_required_subs_handler(callback: types.CallbackQuery):
+    user_id = callback.from_user.id
+    ok, missing = await check_required_subscriptions(user_id)
+    if ok:
+        # отмечаем, что пользователь прошёл требование подписки
+        try:
+            await callback.message.delete()
+        except Exception:
+            pass
+        await callback.answer("✅ Подписки обнаружены — спасибо! Продолжайте работать с ботом.", show_alert=True)
+        await show_start_screen(callback.message, callback.from_user)
+    else:
+        missing_list = "\n".join(missing)
+        await callback.answer(f"❌ Всё ещё не подписаны на: {missing_list}", show_alert=True)
+
 # ==================== БАЗА ДАННЫХ ====================
 async def init_db():
     async with aiosqlite.connect(DB_PATH) as db:
@@ -296,7 +356,7 @@ async def init_db():
         await db.execute("INSERT OR IGNORE INTO settings (key, value) VALUES ('click_enabled', '1')")
         await db.execute("INSERT OR IGNORE INTO settings (key, value) VALUES ('click_reward', ?)", (str(CLICK_REWARD_DEFAULT),))
         await db.execute("INSERT OR IGNORE INTO settings (key, value) VALUES ('click_cooldown_min', ?)", (str(CLICK_COOLDOWN_MIN_DEFAULT),))
-        await db.execute("INSERT OR IGNORE INTO settings (key, value) VALUES ('maintenance_mode', '0')")
+        await db.execute("INSERT OR IGNORE INTO settings (key, value) VALUES ('sponsor_channels', ?)", (",".join(SPONSOR_CHANNELS_DEFAULT),))
         await db.execute("INSERT OR IGNORE INTO settings (key, value) VALUES ('sponsor_channels', ?)", (",".join(SPONSOR_CHANNELS_DEFAULT),))
 
         await db.execute("""
@@ -310,6 +370,10 @@ async def init_db():
         """)
         try:
             await db.execute("ALTER TABLE withdraws ADD COLUMN gift_text TEXT DEFAULT NULL")
+        except Exception:
+            pass
+        try:
+            await db.execute("ALTER TABLE withdraws ADD COLUMN gift_emoji TEXT DEFAULT NULL")
         except Exception:
             pass
 
@@ -356,6 +420,21 @@ async def init_db():
             )
         """)
         await db.execute("CREATE INDEX IF NOT EXISTS idx_balance_log_user_time ON balance_log(user_id, created_at)")
+        
+        # Отметки по капче (последняя успешная капча) и таблица выдачи реферальных наград
+        try:
+            await db.execute("ALTER TABLE users ADD COLUMN last_captcha TIMESTAMP DEFAULT NULL")
+        except Exception:
+            pass
+
+        await db.execute("""
+            CREATE TABLE IF NOT EXISTS referral_awards (
+                referrer_id INTEGER,
+                referred_id INTEGER,
+                awarded_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                PRIMARY KEY (referrer_id, referred_id)
+            )
+        """)
 
         await db.commit()
 
@@ -489,17 +568,17 @@ async def profile_keyboard():
 
 def withdraw_keyboard():
     builder = InlineKeyboardBuilder()
-    builder.button(text="🧸 15⭐", callback_data="withdraw_gift:15")
-    builder.button(text="💖 15⭐", callback_data="withdraw_gift:15")
-    builder.button(text="🎁 25⭐", callback_data="withdraw_gift:25")
-    builder.button(text="🌹 25⭐", callback_data="withdraw_gift:25")
-    builder.button(text="🍾 50⭐", callback_data="withdraw_gift:50")
-    builder.button(text="💐 50⭐", callback_data="withdraw_gift:50")
-    builder.button(text="🚀 50⭐", callback_data="withdraw_gift:50")
-    builder.button(text="🎂 50⭐", callback_data="withdraw_gift:50")
-    builder.button(text="🏆 100⭐", callback_data="withdraw_gift:100")
-    builder.button(text="💍 100⭐", callback_data="withdraw_gift:100")
-    builder.button(text="💎 100⭐", callback_data="withdraw_gift:100")
+    builder.button(text="🧸 15⭐", callback_data="withdraw_gift:15:🧸")
+    builder.button(text="💖 15⭐", callback_data="withdraw_gift:15:💖")
+    builder.button(text="🎁 25⭐", callback_data="withdraw_gift:25:🎁")
+    builder.button(text="🌹 25⭐", callback_data="withdraw_gift:25:🌹")
+    builder.button(text="🍾 50⭐", callback_data="withdraw_gift:50:🍾")
+    builder.button(text="💐 50⭐", callback_data="withdraw_gift:50:💐")
+    builder.button(text="🚀 50⭐", callback_data="withdraw_gift:50:🚀")
+    builder.button(text="🎂 50⭐", callback_data="withdraw_gift:50:🎂")
+    builder.button(text="🏆 100⭐", callback_data="withdraw_gift:100:🏆")
+    builder.button(text="💍 100⭐", callback_data="withdraw_gift:100:💍")
+    builder.button(text="💎 100⭐", callback_data="withdraw_gift:100:💎")
     builder.button(text="← Назад", callback_data="back_to_main")
     builder.adjust(2, 2, 2, 2, 2, 1)
     return builder.as_markup()
@@ -646,26 +725,37 @@ async def start_cmd(message: types.Message, command: CommandObject, state: FSMCo
             (user_id, username, referrer_id, username)
         )
 
-        if is_new and referrer_id:
-            ref_reward = await get_ref_reward()
-            await db.execute("UPDATE users SET balance = balance + ? WHERE user_id = ?", (ref_reward, referrer_id))
-            await log_balance_change(db, referrer_id, ref_reward, "referral")
-            try:
-                ref_reward_esc = escape_md(f"{ref_reward}")
-                await bot.send_message(
-                    referrer_id,
-                    f"🎉 *По вашей ссылке зарегистрировался новый друг\! Вам начислено \+`{ref_reward_esc}` 💫*"
-                )
-            except Exception: pass
+        # Реферальный приз не начисляется сразу при регистрации.
+        # Начисление реферальной награды произойдёт, когда приглашённый выполнит первое задание и подтвердит подписку.
 
         await db.commit()
 
-        async with db.execute("SELECT is_passed_captcha FROM users WHERE user_id = ?", (user_id,)) as cursor:
+        async with db.execute("SELECT is_passed_captcha, last_captcha FROM users WHERE user_id = ?", (user_id,)) as cursor:
             row = await cursor.fetchone()
             is_passed = row[0] if row else 0
+            last_captcha_str = row[1] if row and len(row) > 1 else None
+
+    # Если последняя пройденная капча была более недели назад — потребовать пройти заново
+    if last_captcha_str:
+        try:
+            last_captcha = datetime.fromisoformat(last_captcha_str)
+            if datetime.now() > last_captcha + timedelta(days=7):
+                is_passed = 0
+                async with aiosqlite.connect(DB_PATH) as db:
+                    await db.execute("UPDATE users SET is_passed_captcha = 0 WHERE user_id = ?", (user_id,))
+                    await db.commit()
+        except Exception:
+            pass
 
     if not is_passed:
         await send_captcha(message)
+        return
+
+    # Обязательная подписка на спонсоров при запуске
+    ok_subs, missing = await check_required_subscriptions(user_id)
+    if not ok_subs:
+        text, markup = await render_sponsor_gate(user_id)
+        await message.answer(text, reply_markup=markup)
         return
 
     if args and args.startswith("check_"):
@@ -958,6 +1048,27 @@ async def check_sub_handler(callback: types.CallbackQuery):
                 await log_balance_change(db, user_id, REWARD_PER_SUB, "task")
                 await db.commit()
 
+                # Если у пользователя есть реферер, и за этого реферала ещё не начисляли награду — начисляем
+                async with db.execute("SELECT referrer_id FROM users WHERE user_id = ?", (user_id,)) as rc:
+                    rr = await rc.fetchone()
+                    referrer = rr[0] if rr else None
+                if referrer:
+                    async with db.execute(
+                        "SELECT 1 FROM referral_awards WHERE referrer_id = ? AND referred_id = ?",
+                        (referrer, user_id)
+                    ) as rac:
+                        already = await rac.fetchone()
+                    if not already:
+                        ref_reward = await get_ref_reward()
+                        await db.execute("UPDATE users SET balance = balance + ? WHERE user_id = ?", (ref_reward, referrer))
+                        await db.execute("INSERT INTO referral_awards (referrer_id, referred_id) VALUES (?, ?)", (referrer, user_id))
+                        await log_balance_change(db, referrer, ref_reward, "referral")
+                        try:
+                            ref_reward_esc = escape_md(f"{ref_reward}")
+                            await bot.send_message(referrer, f"🎉 *Вам начислено `{ref_reward_esc}` ⭐ за приглашённого пользователя!*")
+                        except Exception:
+                            pass
+
             await callback.answer("✅ Успешно! Подписка подтверждена, звёзды начислены.", show_alert=True)
             await send_next_task(callback, user_id)
         else:
@@ -1184,21 +1295,20 @@ async def withdraw_cmd(message: types.Message, state: FSMContext):
             row = await cursor.fetchone()
             balance = float(row[0]) if row else 0.0
 
-    min_withdraw = float(await get_setting("min_withdraw", str(MIN_WITHDRAW)))
-
     bal_esc = escape_md(f"{balance:.2f}")
-    min_esc = escape_md(str(int(min_withdraw)))
     text = (
         "💸 *Вывод звёзд*\n\n"
         f"├ Баланс: `{bal_esc}` ⭐\n\n"
         "Выберите подарок для вывода:\n\n"
-        + quote_block(f"*Условия вывода:*\n• Минимальная сумма: *{min_esc}* 💫")
     )
     await message.answer(text, reply_markup=withdraw_keyboard())
 
 @dp.callback_query(F.data.startswith("withdraw_gift:"))
 async def process_withdraw(callback: types.CallbackQuery, state: FSMContext):
-    amount = float(callback.data.split(":")[1])
+    parts = callback.data.split(":")
+    # Формат: withdraw_gift:AMOUNT:EMOJI
+    amount = float(parts[1])
+    emoji = parts[2] if len(parts) > 2 else ""
     user_id = callback.from_user.id
 
     async with aiosqlite.connect(DB_PATH) as db:
@@ -1210,12 +1320,12 @@ async def process_withdraw(callback: types.CallbackQuery, state: FSMContext):
             await callback.answer(f"❌ Недостаточно средств! Нужно: {amount} ⭐", show_alert=True)
             return
 
-    await state.update_data(pending_amount=amount)
+    await state.update_data(pending_amount=amount, pending_emoji=emoji)
 
     price_esc = escape_md(str(GIFT_TEXT_PRICE))
     text = (
         "✍️ *Добавить надпись на подарок?*\n\n"
-        + quote_block(f"Стоимость: \\+{price_esc} ⭐\nНадпись увидит тот, кто получит подарок 💫")
+        + quote_block(f"Стоимость: \\+{price_esc} ⭐")
     )
     await callback.message.edit_text(text, reply_markup=gift_text_ask_keyboard())
     await callback.answer()
@@ -1240,7 +1350,7 @@ async def gift_ask_back_handler(callback: types.CallbackQuery, state: FSMContext
     price_esc = escape_md(str(GIFT_TEXT_PRICE))
     text = (
         "✍️ *Добавить надпись на подарок?*\n\n"
-        + quote_block(f"Стоимость: \\+{price_esc} ⭐\nНадпись увидит тот, кто получит подарок 💫")
+        + quote_block(f"Стоимость: \\+{price_esc} ⭐")
     )
     await callback.message.edit_text(text, reply_markup=gift_text_ask_keyboard())
     await callback.answer()
@@ -1269,6 +1379,7 @@ async def finalize_withdraw(event, state: FSMContext, gift_text: str | None):
     """event может быть types.CallbackQuery (пропуск надписи) или types.Message (ввод текста надписи)."""
     data = await state.get_data()
     amount = data.get("pending_amount")
+    chosen_emoji = data.get("pending_emoji") or ""
     user_id = event.from_user.id
 
     if amount is None:
@@ -1297,8 +1408,8 @@ async def finalize_withdraw(event, state: FSMContext, gift_text: str | None):
 
         await db.execute("UPDATE users SET balance = balance - ? WHERE user_id = ?", (total_cost, user_id))
         cursor = await db.execute(
-            "INSERT INTO withdraws (user_id, amount, gift_text) VALUES (?, ?, ?)",
-            (user_id, amount, gift_text)
+            "INSERT INTO withdraws (user_id, amount, gift_text, gift_emoji) VALUES (?, ?, ?, ?)",
+            (user_id, amount, gift_text, chosen_emoji)
         )
         withdraw_id = cursor.lastrowid
         await db.commit()
@@ -1306,8 +1417,9 @@ async def finalize_withdraw(event, state: FSMContext, gift_text: str | None):
     await state.clear()
 
     gift_text_line = f"\n✍️ Надпись: _{escape_md(gift_text)}_" if gift_text else ""
+    emoji_part = f"{chosen_emoji} " if chosen_emoji else ""
     result_text = (
-        f"🎉 *Заявка на вывод `{int(amount)}` ⭐ успешно оформлена\!*{gift_text_line}\n"
+        f"🎉 *Заявка на вывод {emoji_part}`{int(amount)}` ⭐ успешно оформлена\!*{gift_text_line}\n"
         "Ожидайте подтверждения от администратора\."
     )
 
@@ -1328,21 +1440,23 @@ async def finalize_withdraw(event, state: FSMContext, gift_text: str | None):
     bot_link = f"https://t.me/{clean_bot_username}"
     bot_link_esc = escape_md(bot_link)
 
+    # Лог в публичный канал — без персональной надписи
+    emoji_part_esc = escape_md(chosen_emoji) if chosen_emoji else ""
     request_log = (
-        "🧾 *Новая заявка\\!*\n\n"
+        "🧾 *Новая заявка\!*\n\n"
         f"👤 {user_mention_esc}\n"
-        f"⏳ {amount_esc} ⭐ ожидает подтверждения"
-        f"{gift_text_line}\n\n"
+        f"⏳ {amount_esc} ⭐ ожидает подтверждения {emoji_part_esc}\n\n"
         f"[{escape_md(BOT_USERNAME)}]({bot_link_esc})"
     )
     await send_log(request_log)
 
     gift_admin_line = f"\n✍️ Надпись: _{escape_md(gift_text)}_" if gift_text else ""
+    emoji_admin = escape_md(chosen_emoji) if chosen_emoji else ""
     admin_msg = (
-        "💸 *Новая заявка на вывод\\!*\n\n"
+        "💸 *Новая заявка на вывод!*\n\n"
         f"🆔 Заявка: \\#{withdraw_id}\n"
         f"👤 Пользователь: {user_mention_esc}\n"
-        f"💰 Сумма: *{amount_esc} ⭐*"
+        f"💰 Сумма: *{amount_esc} ⭐* {emoji_admin}"
         f"{gift_admin_line}"
     )
 
@@ -1367,7 +1481,7 @@ async def withdraw_approve_handler(callback: types.CallbackQuery):
 
     async with aiosqlite.connect(DB_PATH) as db:
         async with db.execute(
-            "SELECT w.user_id, w.amount, w.status, u.username, w.gift_text "
+            "SELECT w.user_id, w.amount, w.status, u.username, w.gift_text, w.gift_emoji "
             "FROM withdraws w LEFT JOIN users u ON w.user_id = u.user_id "
             "WHERE w.id = ?",
             (w_id,)
@@ -1378,7 +1492,7 @@ async def withdraw_approve_handler(callback: types.CallbackQuery):
             await callback.answer("Заявка не найдена!", show_alert=True)
             return
 
-        u_id, amt, status, u_name, gift_text = row
+        u_id, amt, status, u_name, gift_text, gift_emoji = row
         if status != "pending":
             await callback.answer("Заявка уже обработана!", show_alert=True)
             return
@@ -1389,10 +1503,11 @@ async def withdraw_approve_handler(callback: types.CallbackQuery):
     try:
         await bot.send_message(
             u_id,
-            f"✅ Ваша заявка #{w_id} на {int(amt)} ⭐️ была успешно обработана! Подарок отправлен.",
+            f"✅ Ваша заявка на {int(amt)} ⭐ была успешно обработана! Подарок отправлен.",
             parse_mode=None
         )
-    except Exception: pass
+    except Exception:
+        pass
 
     user_mention = f"@{u_name}" if u_name else f"ID: {u_id}"
     user_mention_esc = escape_md(user_mention)
@@ -1401,9 +1516,10 @@ async def withdraw_approve_handler(callback: types.CallbackQuery):
     bot_link = f"https://t.me/{clean_bot_username}"
     bot_link_esc = escape_md(bot_link)
     gift_log_line = f"\n✍️ Надпись: _{escape_md(gift_text)}_" if gift_text else ""
+    emoji_str = f" {escape_md(gift_emoji)}" if gift_emoji else ""
 
     payout_log = (
-        "🧾 *Новая выплата\\!*\n\n"
+        "✅ *Новая выплата!*\n\n"
         f"👤 {user_mention_esc}\n"
         f"✅ {amt_esc} ⭐ успешно выведено"
         f"{gift_log_line}\n\n"
@@ -1412,11 +1528,12 @@ async def withdraw_approve_handler(callback: types.CallbackQuery):
     await send_log(payout_log)
 
     gift_status_line = f"\n✍️ Надпись: _{escape_md(gift_text)}_" if gift_text else ""
+    emoji_admin = f" {escape_md(gift_emoji)}" if gift_emoji else ""
     status_admin_msg = (
-        "💸 *Новая заявка на вывод\\!*\n\n"
+        "💸 *Новая заявка на вывод!*\n\n"
         f"🆔 Заявка: \\#{w_id}\n"
         f"👤 Пользователь: {user_mention_esc}\n"
-        f"💰 Сумма: *{amt_esc} ⭐*"
+        f"💰 Сумма: *{amt_esc} ⭐*{emoji_admin}"
         f"{gift_status_line}\n\n"
         "✅ *СТАТУС: ВЫДАНО*"
     )
@@ -1430,7 +1547,7 @@ async def withdraw_reject_handler(callback: types.CallbackQuery):
 
     async with aiosqlite.connect(DB_PATH) as db:
         async with db.execute(
-            "SELECT w.user_id, w.amount, w.status, u.username, w.gift_text "
+            "SELECT w.user_id, w.amount, w.status, u.username, w.gift_text, w.gift_emoji "
             "FROM withdraws w LEFT JOIN users u ON w.user_id = u.user_id "
             "WHERE w.id = ?",
             (w_id,)
@@ -1441,7 +1558,7 @@ async def withdraw_reject_handler(callback: types.CallbackQuery):
             await callback.answer("Заявка не найдена!", show_alert=True)
             return
 
-        u_id, amt, status, u_name, gift_text = row
+        u_id, amt, status, u_name, gift_text, gift_emoji = row
         if status != "pending":
             await callback.answer("Заявка уже обработана!", show_alert=True)
             return
@@ -1454,19 +1571,21 @@ async def withdraw_reject_handler(callback: types.CallbackQuery):
         await db.commit()
 
     try:
-        await bot.send_message(u_id, f"❌ Ваша заявка #{w_id} на {int(amt)} ⭐ была отклонена. Средства возвращены на баланс.", parse_mode=None)
-    except Exception: pass
+        await bot.send_message(u_id, f"❌ Ваша заявка на {int(amt)} ⭐ была отклонена. Звёзды возвращены на баланс.", parse_mode=None)
+    except Exception:
+        pass
 
     user_mention = f"@{u_name}" if u_name else f"ID: {u_id}"
     user_mention_esc = escape_md(user_mention)
     amt_esc = escape_md(str(int(amt)))
     gift_status_line = f"\n✍️ Надпись: _{escape_md(gift_text)}_" if gift_text else ""
+    emoji_admin = f" {escape_md(gift_emoji)}" if gift_emoji else ""
 
     status_admin_msg = (
-        "💸 *Новая заявка на вывод\\!*\n\n"
+        "💸 *Новая заявка на вывод!*\n\n"
         f"🆔 Заявка: \\#{w_id}\n"
         f"👤 Пользователь: {user_mention_esc}\n"
-        f"💰 Сумма: *{amt_esc} ⭐*"
+        f"💰 Сумма: *{amt_esc} ⭐*{emoji_admin}"
         f"{gift_status_line}\n\n"
         "❌ *СТАТУС: ОТКЛОНЕНО*"
     )
@@ -1545,16 +1664,7 @@ async def admin_toggle_top_handler(callback: types.CallbackQuery):
     status_text = "включена ✅" if new_value == "1" else "отключена ❌"
     await callback.answer(f"Кнопка топов теперь: {status_text}", show_alert=True)
 
-# --- Режим техобслуживания ---
-@dp.callback_query(F.data == "admin_toggle_maintenance")
-async def admin_toggle_maintenance_handler(callback: types.CallbackQuery):
-    if not await is_admin(callback.from_user.id): return
-    current = await is_maintenance_mode()
-    new_value = "0" if current else "1"
-    await set_setting("maintenance_mode", new_value)
-
-    status_text = "включён 🛠 (бот недоступен обычным юзерам)" if new_value == "1" else "выключен ✅ (бот работает для всех)"
-    await callback.answer(f"Режим техработ теперь: {status_text}", show_alert=True)
+# Режим техработ удалён по просьбе владельца (функция отключена)
 
 # --- Статистика ---
 @dp.callback_query(F.data == "admin_stats")
@@ -1807,7 +1917,7 @@ async def admin_pending_withdraws_page(callback: types.CallbackQuery):
 
     async with aiosqlite.connect(DB_PATH) as db:
         async with db.execute(
-            "SELECT w.id, w.user_id, w.amount, u.username, w.gift_text "
+            "SELECT w.id, w.user_id, w.amount, u.username, w.gift_text, w.gift_emoji "
             "FROM withdraws w "
             "LEFT JOIN users u ON w.user_id = u.user_id "
             "WHERE w.status = 'pending' "
@@ -1838,11 +1948,12 @@ async def admin_pending_withdraws_page(callback: types.CallbackQuery):
         "━━━━━━━━━━━━━━━━━━"
     ]
 
-    for w_id, u_id, amt, u_name, gtext in page_items:
+    for w_id, u_id, amt, u_name, gtext, gemoji in page_items:
         u_info = f"@{escape_md(u_name)}" if u_name else f"`{u_id}`"
         amt_esc = escape_md(f"{int(amt)}")
         gift_line = f"\n✍️ _{escape_md(gtext)}_" if gtext else ""
-        text_lines.append(f"🆔 \\#{w_id} · 👤 {u_info} · 💰 *{amt_esc}* ⭐{gift_line}")
+        emoji_part = f" {escape_md(gemoji)}" if gemoji else ""
+        text_lines.append(f"🆔 \\#{w_id} · 👤 {u_info} · 💰 *{amt_esc}* ⭐{emoji_part}{gift_line}")
         text_lines.append("━━━━━━━━━━━━━━━━━━")
 
     text = "\n".join(text_lines)
@@ -1933,6 +2044,37 @@ async def admin_set_ref_reward_start(callback: types.CallbackQuery, state: FSMCo
     await callback.message.answer(text)
     await state.set_state(AdminStates.waiting_for_ref_reward)
     await callback.answer()
+
+
+@dp.callback_query(F.data == "admin_sponsor_setup")
+async def admin_sponsor_setup_start(callback: types.CallbackQuery, state: FSMContext):
+    if not await is_admin(callback.from_user.id): return
+    text = (
+        "📣 *Настройка спонсоров*\n\n"
+        "Пришлите список юзернеймов каналов через запятую или каждую ссылку с новой строки\n"
+        "Например: @StarPays_Reviews, @StarPay_s"
+    )
+    await callback.message.answer(text)
+    await state.set_state(AdminStates.waiting_for_sponsors)
+    await callback.answer()
+
+
+@dp.message(AdminStates.waiting_for_sponsors)
+async def admin_sponsor_setup_process(message: types.Message, state: FSMContext):
+    if not await is_admin(message.from_user.id): return
+    if message.text in MENU_BUTTONS:
+        await state.clear()
+        return
+
+    raw = message.text.strip()
+    items = [part.strip() for part in re.split(r"[\n,]+", raw) if part.strip()]
+    if not items:
+        await message.answer("❌ Неверный формат. Укажите хотя бы один канал.")
+        return
+
+    await set_sponsor_channels(items)
+    await message.answer(f"✅ Список спонсорских каналов обновлён\: {escape_md(', '.join(items))}")
+    await state.clear()
 
 @dp.message(AdminStates.waiting_for_ref_reward)
 async def admin_set_ref_reward_process(message: types.Message, state: FSMContext):
@@ -2541,6 +2683,7 @@ async def list_channels(callback: types.CallbackQuery):
         text += f"• \\#{ch[0]} — *{ch_title_esc}*\n"
         builder.button(text=f"❌ Удалить #{ch[0]}", callback_data=f"del_ch:{ch[0]}")
 
+    builder.button(text="← Назад", callback_data="admin_back_to_panel")
     builder.adjust(2)
     try:
         await callback.message.edit_text(text, reply_markup=builder.as_markup())
@@ -2564,6 +2707,7 @@ async def main():
     logging.info(f"Используется база данных: {DB_PATH}")
     await init_db()
     asyncio.create_task(backup_db_loop())
+    asyncio.create_task(daily_broadcast_loop())
     while True:
         try:
             await dp.start_polling(bot)
