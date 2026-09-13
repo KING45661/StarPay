@@ -20,7 +20,6 @@ from aiogram.fsm.state import State, StatesGroup
 from aiogram.fsm.storage.memory import MemoryStorage
 from aiogram.utils.keyboard import InlineKeyboardBuilder, ReplyKeyboardBuilder
 
-# ==================== НАСТРОЙКИ ====================
 load_dotenv()
 
 BOT_TOKEN = os.getenv("BOT_TOKEN")
@@ -34,16 +33,12 @@ REWARD_PER_SUB = 0.25
 UNSUB_PENALTY = 1.0
 MIN_WITHDRAW = 15.0
 
-# Читает путь из переменных Railway (переживает деплои, если подключён volume).
-# Если переменной нет (локальный запуск) — использует файл рядом со скриптом.
 DB_PATH = os.getenv("DB_PATH", "/app/data/bot_database.db")
-
-# Гарантируем, что директория для базы существует (важно для Railway volume)
 Path(DB_PATH).parent.mkdir(parents=True, exist_ok=True)
 
 WITHDRAWS_PER_PAGE = 10
 TOP_USERS_LIMIT = 10
-ADMIN_BUTTONS_PER_PAGE = 6  # сколько кнопок админ-панели показываем на одной "странице"
+ADMIN_BUTTONS_PER_PAGE = 6
 
 DAILY_BONUS_MIN = 0.1
 DAILY_BONUS_MAX = 1.0
@@ -52,9 +47,8 @@ DAILY_BONUS_STEP = 0.1
 GIFT_TEXT_PRICE = 0.5
 GIFT_TEXT_MAX_LEN = 100
 
-# --- Кнопка "Клик" (значения по умолчанию, далее хранятся/переопределяются в settings) ---
 CLICK_REWARD_DEFAULT = 0.1
-CLICK_COOLDOWN_MIN_DEFAULT = 10  # минут
+CLICK_COOLDOWN_MIN_DEFAULT = 10
 
 CAPTCHA_FRUITS = [
     ("🥭", "манго"),
@@ -76,7 +70,6 @@ def escape_md(text: str) -> str:
     return re.sub(r'([_ *\[\]()~`>#+\-=|{}.!])', r'\\\1', str(text))
 
 def quote_block(text: str) -> str:
-    """Оформляет многострочный текст как MarkdownV2-цитату (каждая строка с префиксом '> ')."""
     lines = text.split("\n")
     return "\n".join(f">{line}" if line else ">" for line in lines)
 
@@ -91,7 +84,6 @@ bot = Bot(
 )
 dp = Dispatcher(storage=MemoryStorage())
 
-# ==================== ХЕЛПЕР ЛОГИРОВАНИЯ ====================
 async def send_log(text: str, disable_preview: bool = False):
     if LOG_CHANNEL_ID:
         try:
@@ -105,9 +97,6 @@ async def send_log(text: str, disable_preview: bool = False):
             logging.error(f"Ошибка отправки лога в канал: {e}")
 
 async def log_balance_change(db: aiosqlite.Connection, user_id: int, amount: float, source: str):
-    """Записывает положительное начисление в лог для расчёта топов по периодам.
-    source: 'task' | 'referral' | 'daily' | 'promo' | 'check' | 'admin' | 'click'
-    Отрицательные изменения (штрафы, выводы) сюда не пишутся — топы считают заработок, не текущий баланс."""
     if amount <= 0:
         return
     await db.execute(
@@ -144,7 +133,6 @@ async def is_maintenance_mode() -> bool:
     val = await get_setting("maintenance_mode", "0")
     return val == "1"
 
-# ==================== БЭКАП БАЗЫ ====================
 async def backup_db_loop():
     backup_dir = Path(DB_PATH).parent / "backups"
     backup_dir.mkdir(parents=True, exist_ok=True)
@@ -164,7 +152,6 @@ async def backup_db_loop():
 
         await asyncio.sleep(24 * 60 * 60)
 
-# ==================== БАЗА ДАННЫХ ====================
 async def init_db():
     async with aiosqlite.connect(DB_PATH) as db:
         await db.execute("""
@@ -173,6 +160,7 @@ async def init_db():
                 username TEXT,
                 balance REAL DEFAULT 0.0,
                 is_passed_captcha INTEGER DEFAULT 0,
+                captcha_date TEXT DEFAULT NULL,
                 completed_tasks TEXT DEFAULT '',
                 used_promo INTEGER DEFAULT 0,
                 referrer_id INTEGER DEFAULT NULL,
@@ -188,7 +176,8 @@ async def init_db():
             "created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP",
             "last_daily TIMESTAMP DEFAULT NULL",
             "last_click TIMESTAMP DEFAULT NULL",
-            "is_banned INTEGER DEFAULT 0"
+            "is_banned INTEGER DEFAULT 0",
+            "captcha_date TEXT DEFAULT NULL"
         ]:
             try:
                 await db.execute(f"ALTER TABLE users ADD COLUMN {col_def}")
@@ -222,6 +211,8 @@ async def init_db():
         await db.execute("INSERT OR IGNORE INTO settings (key, value) VALUES ('click_reward', ?)", (str(CLICK_REWARD_DEFAULT),))
         await db.execute("INSERT OR IGNORE INTO settings (key, value) VALUES ('click_cooldown_min', ?)", (str(CLICK_COOLDOWN_MIN_DEFAULT),))
         await db.execute("INSERT OR IGNORE INTO settings (key, value) VALUES ('maintenance_mode', '0')")
+        await db.execute("INSERT OR IGNORE INTO settings (key, value) VALUES ('sponsor_1', '@StarPays_Reviews')")
+        await db.execute("INSERT OR IGNORE INTO settings (key, value) VALUES ('sponsor_2', '@StarPay_s')")
 
         await db.execute("""
             CREATE TABLE IF NOT EXISTS withdraws (
@@ -249,7 +240,6 @@ async def init_db():
             )
         """)
 
-        # Промокоды: множественные, с лимитом активаций и суммой
         await db.execute("""
             CREATE TABLE IF NOT EXISTS promocodes (
                 code TEXT PRIMARY KEY,
@@ -259,7 +249,6 @@ async def init_db():
                 created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
             )
         """)
-        # Кто уже активировал какой промокод
         await db.execute("""
             CREATE TABLE IF NOT EXISTS promo_activations (
                 promo_code TEXT,
@@ -269,7 +258,6 @@ async def init_db():
             )
         """)
 
-        # Лог начислений для расчёта топов "за день/неделю/всё время"
         await db.execute("""
             CREATE TABLE IF NOT EXISTS balance_log (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -300,7 +288,6 @@ async def is_user_banned(user_id: int) -> bool:
 async def get_ref_reward() -> float:
     return float(await get_setting("ref_reward", "5.0"))
 
-# ==================== FSM ====================
 class AdminStates(StatesGroup):
     waiting_for_channel = State()
     waiting_for_welcome_photo = State()
@@ -320,12 +307,13 @@ class AdminStates(StatesGroup):
     waiting_for_min_withdraw = State()
     waiting_for_find_user = State()
     waiting_for_admin_remove = State()
+    waiting_for_sponsor_1 = State()
+    waiting_for_sponsor_2 = State()
 
 class UserStates(StatesGroup):
     waiting_for_promo = State()
     waiting_for_gift_text = State()
 
-# ==================== КЛАВИАТУРЫ ====================
 async def main_keyboard(user_id: int):
     builder = ReplyKeyboardBuilder()
     builder.button(text="💎 Задания")
@@ -339,7 +327,6 @@ async def main_keyboard(user_id: int):
     builder.adjust(2, 2, 2, 1)
     return builder.as_markup(resize_keyboard=True)
 
-# --- Постраничная админ-панель ---
 ADMIN_MENU_ITEMS = [
     ("📊 Статистика", "admin_stats"),
     ("🏆 Топ пользователей", "admin_top_users"),
@@ -350,13 +337,12 @@ ADMIN_MENU_ITEMS = [
     ("🎟 Создать чек", "admin_create_check"),
     ("➕ Добавить канал", "admin_add_channel"),
     ("📋 Список каналов", "admin_list_channels"),
+    ("📢 Обязательные спонсоры", "admin_sponsors_menu"),
     ("📢 Рассылка", "admin_broadcast"),
     ("🖼 Изменить баннер", "admin_set_photo"),
     ("⚙️ Настройка рефки", "admin_set_ref_reward"),
     ("🖱 Настройка Клика", "admin_click_menu"),
-    ("💳 Мин. сумма вывода", "admin_set_min_withdraw"),
     ("🏆 Топы: вкл/выкл", "admin_toggle_top"),
-    ("🛠 Режим техработ", "admin_toggle_maintenance"),
     ("🚫 Забанить пользователя", "admin_ban_user"),
     ("✅ Разбанить пользователя", "admin_unban_user"),
     ("➕ Добавить админа", "admin_add_admin"),
@@ -453,7 +439,6 @@ def promo_menu_keyboard():
     builder.adjust(1)
     return builder.as_markup()
 
-# ==================== КАПЧА ====================
 def generate_captcha_keyboard(correct_fruit_emoji: str):
     builder = InlineKeyboardBuilder()
     shuffled = CAPTCHA_FRUITS.copy()
@@ -475,8 +460,9 @@ async def send_captcha(message: types.Message):
 async def process_captcha(callback: types.CallbackQuery):
     _, clicked, correct = callback.data.split(":")
     if clicked == correct:
+        now_str = datetime.now().isoformat()
         async with aiosqlite.connect(DB_PATH) as db:
-            await db.execute("UPDATE users SET is_passed_captcha = 1 WHERE user_id = ?", (callback.from_user.id,))
+            await db.execute("UPDATE users SET is_passed_captcha = 1, captcha_date = ? WHERE user_id = ?", (now_str, callback.from_user.id,))
             await db.commit()
         await callback.answer("✅ Проверка успешно пройдена!", show_alert=True)
         await callback.message.delete()
@@ -490,26 +476,56 @@ async def process_captcha(callback: types.CallbackQuery):
         )
         await callback.message.edit_text(text, reply_markup=generate_captcha_keyboard(target_emoji))
 
-# ==================== ГЛОБАЛЬНАЯ ПРОВЕРКА БАНА / ТЕХРАБОТ ====================
+async def check_sponsors_subscription(user_id: int) -> bool:
+    s1 = await get_setting("sponsor_1", "@StarPays_Reviews")
+    s2 = await get_setting("sponsor_2", "@StarPay_s")
+    sponsors = [s1, s2]
+    for sp in sponsors:
+        if not sp:
+            continue
+        try:
+            member = await bot.get_chat_member(chat_id=sp, user_id=user_id)
+            if member.status not in ["member", "administrator", "creator"]:
+                return False
+        except Exception:
+            return False
+    return True
+
+async def send_sponsors_requirement(message: types.Message):
+    s1 = await get_setting("sponsor_1", "@StarPays_Reviews")
+    s2 = await get_setting("sponsor_2", "@StarPay_s")
+    builder = InlineKeyboardBuilder()
+    if s1:
+        builder.button(text="📢 Спонсор 1", url=f"https://t.me/{s1.replace('@', '')}")
+    if s2:
+        builder.button(text="📢 Спонсор 2", url=f"https://t.me/{s2.replace('@', '')}")
+    builder.button(text="✅ Я подписался", callback_data="check_sponsors_sub")
+    builder.adjust(1)
+
+    text = (
+        "⚠️ *Обязательная подписка*\n\n"
+        + quote_block(f"Для использования бота необходимо подписаться на наши спонсорские каналы:\n• {s1}\n• {s2}\n\nПодпишитесь и нажмите кнопку проверки ниже\\!")
+    )
+    await message.answer(text, reply_markup=builder.as_markup())
+
+@dp.callback_query(F.data == "check_sponsors_sub")
+async def check_sponsors_sub_callback(callback: types.CallbackQuery):
+    user_id = callback.from_user.id
+    if await check_sponsors_subscription(user_id):
+        await callback.answer("✅ Подписка подтверждена!", show_alert=True)
+        await callback.message.delete()
+        await show_start_screen(callback.message, callback.from_user)
+    else:
+        await callback.answer("❌ Вы подписались не на все каналы!", show_alert=True)
+
 @dp.message(F.text.in_(MENU_BUTTONS))
 async def guard_menu_buttons(message: types.Message, state: FSMContext):
-    """Пропускает нажатия кнопок меню дальше только если юзер не забанен
-    и (бот не на техобслуживании ИЛИ юзер админ). Используется как 'страж'
-    перед остальными хендлерами благодаря порядку регистрации."""
     user_id = message.from_user.id
 
     if await is_user_banned(user_id):
         await message.answer("🚫 *Вы заблокированы в этом боте\.*\nОбратитесь к администрации, если считаете это ошибкой\.")
         return
 
-    if await is_maintenance_mode() and not await is_admin(user_id):
-        await message.answer(
-            "🛠 *Бот временно находится на техническом обслуживании\.*\n"
-            "Пожалуйста, попробуйте зайти немного позже\."
-        )
-        return
-
-    # "Пропускаем" сообщение дальше вручную, вызывая нужный обработчик
     handlers = {
         "💎 Задания": earn_cmd,
         "👥 Друзья": friends_cmd,
@@ -523,7 +539,6 @@ async def guard_menu_buttons(message: types.Message, state: FSMContext):
     if handler:
         await handler(message, state)
 
-# ==================== СТАРТ ====================
 async def show_start_screen(message: types.Message, user: types.User):
     first_name_esc = escape_md(user.first_name)
     welcome_text = (
@@ -552,8 +567,15 @@ async def start_cmd(message: types.Message, command: CommandObject, state: FSMCo
     args = command.args
 
     async with aiosqlite.connect(DB_PATH) as db:
-        async with db.execute("SELECT user_id FROM users WHERE user_id = ?", (user_id,)) as cursor:
-            is_new = await cursor.fetchone() is None
+        async with db.execute("SELECT user_id, is_passed_captcha, captcha_date FROM users WHERE user_id = ?", (user_id,)) as cursor:
+            user_row = await cursor.fetchone()
+        
+        is_new = user_row is None
+        is_passed = 0
+        captcha_date_str = None
+        if user_row:
+            is_passed = user_row[1]
+            captcha_date_str = user_row[2]
 
         referrer_id = None
         if is_new and args and args.isdigit() and int(args) != user_id:
@@ -567,24 +589,36 @@ async def start_cmd(message: types.Message, command: CommandObject, state: FSMCo
 
         if is_new and referrer_id:
             ref_reward = await get_ref_reward()
-            await db.execute("UPDATE users SET balance = balance + ? WHERE user_id = ?", (ref_reward, referrer_id))
-            await log_balance_change(db, referrer_id, ref_reward, "referral")
             try:
-                ref_reward_esc = escape_md(f"{ref_reward}")
-                await bot.send_message(
-                    referrer_id,
-                    f"🎉 *По вашей ссылке зарегистрировался новый друг\! Вам начислено \+`{ref_reward_esc}` 💫*"
-                )
-            except Exception: pass
+                async with db.execute("SELECT completed_tasks FROM users WHERE user_id = ?", (user_id,)) as c:
+                    r_tasks = (await c.fetchone())[0]
+                    completed_list = r_tasks.split(",") if r_tasks else []
+                if len(completed_list) >= 1:
+                    await db.execute("UPDATE users SET balance = balance + ? WHERE user_id = ?", (ref_reward, referrer_id))
+                    await log_balance_change(db, referrer_id, ref_reward, "referral")
+                    await bot.send_message(
+                        referrer_id,
+                        f"🎉 *По вашей ссылке зарегистрировался друг и выполнил задание\! Вам начислено \+`{escape_md(str(ref_reward))}` 💫*"
+                    )
+            except Exception:
+                pass
 
         await db.commit()
 
-        async with db.execute("SELECT is_passed_captcha FROM users WHERE user_id = ?", (user_id,)) as cursor:
-            row = await cursor.fetchone()
-            is_passed = row[0] if row else 0
+    if is_passed and captcha_date_str:
+        try:
+            c_date = datetime.fromisoformat(captcha_date_str)
+            if datetime.now() >= c_date + timedelta(days=7):
+                is_passed = 0
+        except Exception:
+            is_passed = 0
 
     if not is_passed:
         await send_captcha(message)
+        return
+
+    if not await check_sponsors_subscription(user_id):
+        await send_sponsors_requirement(message)
         return
 
     if args and args.startswith("check_"):
@@ -626,7 +660,6 @@ async def start_cmd(message: types.Message, command: CommandObject, state: FSMCo
 async def check_already_used_handler(callback: types.CallbackQuery):
     await callback.answer("Этот чек уже был активирован!", show_alert=True)
 
-# ==================== ЕЖЕДНЕВНЫЙ БОНУС ====================
 async def daily_bonus_cmd(message: types.Message, state: FSMContext):
     await state.clear()
     user_id = message.from_user.id
@@ -656,7 +689,6 @@ async def daily_bonus_cmd(message: types.Message, state: FSMContext):
     bonus_esc = escape_md(f"{bonus_amount:.1f}")
     await message.answer(f"🎁 *Поздравляем\! Вы получили ежедневный бонус: \+{bonus_esc} ⭐*")
 
-# ==================== КНОПКА "КЛИК" ====================
 async def click_cmd(message: types.Message, state: FSMContext):
     await state.clear()
     user_id = message.from_user.id
@@ -700,7 +732,6 @@ async def click_cmd(message: types.Message, state: FSMContext):
         + quote_block(f"Начислено: \\+{reward_esc} ⭐\nСледующий клик будет доступен через {cd_esc} мин\\.")
     )
 
-# ==================== ДРУЗЬЯ ====================
 async def friends_cmd(message: types.Message, state: FSMContext):
     await state.clear()
     user_id = message.from_user.id
@@ -733,7 +764,6 @@ async def friends_cmd(message: types.Message, state: FSMContext):
 
     await message.answer(text, reply_markup=builder.as_markup())
 
-# ==================== ЗАДАНИЯ ====================
 async def check_unsubscriptions(user_id: int):
     async with aiosqlite.connect(DB_PATH) as db:
         async with db.execute("SELECT completed_tasks FROM users WHERE user_id = ?", (user_id,)) as cursor:
@@ -779,6 +809,13 @@ async def check_unsubscriptions(user_id: int):
             except Exception: pass
 
 async def send_next_task(event, user_id: int):
+    if not await check_sponsors_subscription(user_id):
+        if isinstance(event, types.CallbackQuery):
+            await event.message.answer("⚠️ Сначала подпишитесь на спонсоров!")
+        else:
+            await send_sponsors_requirement(event)
+        return
+
     await check_unsubscriptions(user_id)
 
     async with aiosqlite.connect(DB_PATH) as db:
@@ -850,6 +887,10 @@ async def earn_cmd(message: types.Message, state: FSMContext):
 
 @dp.callback_query(F.data.startswith("check_sub:"))
 async def check_sub_handler(callback: types.CallbackQuery):
+    if not await check_sponsors_subscription(callback.from_user.id):
+        await callback.answer("❌ Сначала подпишитесь на спонсоров!", show_alert=True)
+        return
+
     _, ch_db_id, ch_id = callback.data.split(":")
     user_id = callback.from_user.id
 
@@ -857,14 +898,17 @@ async def check_sub_handler(callback: types.CallbackQuery):
         member = await bot.get_chat_member(chat_id=ch_id, user_id=user_id)
         if member.status in ["member", "administrator", "creator"]:
             async with aiosqlite.connect(DB_PATH) as db:
-                async with db.execute("SELECT completed_tasks, COALESCE(balance, 0.0) FROM users WHERE user_id = ?", (user_id,)) as cursor:
+                async with db.execute("SELECT completed_tasks, COALESCE(balance, 0.0), referrer_id FROM users WHERE user_id = ?", (user_id,)) as cursor:
                     row = await cursor.fetchone()
                     completed = row[0].split(",") if row and row[0] else []
                     balance = float(row[1]) if row else 0.0
+                    referrer_id = row[2] if row else None
 
                 if str(ch_db_id) in completed:
                     await callback.answer("❌ Вы уже получили награду за это задание!", show_alert=True)
                     return
+
+                is_first_task = len(completed) == 0
 
                 completed.append(str(ch_db_id))
                 new_completed_str = ",".join(completed)
@@ -875,6 +919,24 @@ async def check_sub_handler(callback: types.CallbackQuery):
                     (new_balance, new_completed_str, user_id)
                 )
                 await log_balance_change(db, user_id, REWARD_PER_SUB, "task")
+
+                if is_first_task and referrer_id:
+                    ref_reward = await get_ref_reward()
+                    await db.execute("UPDATE users SET balance = balance + ? WHERE user_id = ?", (ref_reward, referrer_id))
+                    await log_balance_change(db, referrer_id, ref_reward, "referral")
+                    try:
+                        await bot.service_message_or_send(
+                            referrer_id,
+                            f"🎉 *Приглашенный вами пользователь выполнил задание\! Начислено \+`{escape_md(str(ref_reward))}` 💫*"
+                        )
+                    except Exception:
+                        try:
+                            await bot.send_message(
+                                referrer_id,
+                                f"🎉 *Приглашенный вами пользователь выполнил задание\! Начислено \+`{escape_md(str(ref_reward))}` 💫*"
+                            )
+                        except Exception: pass
+
                 await db.commit()
 
             await callback.answer("✅ Успешно! Подписка подтверждена, звёзды начислены.", show_alert=True)
@@ -889,7 +951,6 @@ async def skip_task_handler(callback: types.CallbackQuery):
     await callback.answer("Задание пропущено", show_alert=False)
     await send_next_task(callback, callback.from_user.id)
 
-# ==================== ПРОФИЛЬ ====================
 async def profile_cmd(message: types.Message, state: FSMContext):
     await state.clear()
     user_id = message.from_user.id
@@ -959,9 +1020,7 @@ async def profile_back_handler(callback: types.CallbackQuery, state: FSMContext)
         await callback.message.answer(profile_text, reply_markup=await profile_keyboard())
     await callback.answer()
 
-# ==================== ТОП ПОЛЬЗОВАТЕЛЕЙ (профиль) ====================
 async def build_top_text(period: str) -> str:
-    """period: 'day' | 'week' | 'all'"""
     async with aiosqlite.connect(DB_PATH) as db:
         if period == "all":
             query = "SELECT user_id, username, balance FROM users ORDER BY balance DESC LIMIT ?"
@@ -1016,7 +1075,6 @@ async def show_top_handler(callback: types.CallbackQuery):
         await callback.message.answer(text, reply_markup=top_period_keyboard(period))
     await callback.answer()
 
-# ==================== ПРОМОКОДЫ (пользователь) ====================
 @dp.callback_query(F.data == "activate_promo")
 async def promo_start(callback: types.CallbackQuery, state: FSMContext):
     await callback.message.answer("🎟 *Введите промокод:*")
@@ -1027,7 +1085,7 @@ async def promo_start(callback: types.CallbackQuery, state: FSMContext):
 async def promo_process(message: types.Message, state: FSMContext):
     if message.text in MENU_BUTTONS:
         await state.clear()
-        return  # обработает guard_menu_buttons
+        return
 
     code = (message.text or "").strip().upper()
     if not code:
@@ -1065,13 +1123,11 @@ async def promo_process(message: types.Message, state: FSMContext):
             await state.clear()
             return
 
-        # Гарантируем, что пользователь есть в таблице users, и коммитим это ДО обновления баланса
         await db.execute(
             "INSERT INTO users (user_id, balance) VALUES (?, 0.0) ON CONFLICT(user_id) DO NOTHING", (user_id,)
         )
         await db.commit()
 
-        # Начисляем баланс и фиксируем активацию промокода
         await db.execute("UPDATE users SET balance = balance + ? WHERE user_id = ?", (amount, user_id))
         await db.execute(
             "INSERT INTO promo_activations (promo_code, user_id) VALUES (?, ?)", (code, user_id)
@@ -1080,7 +1136,6 @@ async def promo_process(message: types.Message, state: FSMContext):
             "UPDATE promocodes SET used_activations = used_activations + 1 WHERE code = ?", (code,)
         )
         await log_balance_change(db, user_id, amount, "promo")
-        # ВАЖНО: коммит сразу после UPDATE баланса, до чтения нового значения
         await db.commit()
 
         async with db.execute("SELECT balance FROM users WHERE user_id = ?", (user_id,)) as cursor:
@@ -1094,7 +1149,6 @@ async def promo_process(message: types.Message, state: FSMContext):
 
     await state.clear()
 
-# ==================== ВЫВОД ====================
 async def withdraw_cmd(message: types.Message, state: FSMContext):
     await state.clear()
     async with aiosqlite.connect(DB_PATH) as db:
@@ -1102,15 +1156,11 @@ async def withdraw_cmd(message: types.Message, state: FSMContext):
             row = await cursor.fetchone()
             balance = float(row[0]) if row else 0.0
 
-    min_withdraw = float(await get_setting("min_withdraw", str(MIN_WITHDRAW)))
-
     bal_esc = escape_md(f"{balance:.2f}")
-    min_esc = escape_md(str(int(min_withdraw)))
     text = (
         "💸 *Вывод звёзд*\n\n"
         f"├ Баланс: `{bal_esc}` ⭐\n\n"
-        "Выберите подарок для вывода:\n\n"
-        + quote_block(f"*Условия вывода:*\n• Минимальная сумма: *{min_esc}* 💫")
+        "Выберите подарок для вывода:"
     )
     await message.answer(text, reply_markup=withdraw_keyboard())
 
@@ -1150,7 +1200,6 @@ async def gift_ask_yes_handler(callback: types.CallbackQuery, state: FSMContext)
 
 @dp.callback_query(F.data == "gift_ask_back")
 async def gift_ask_back_handler(callback: types.CallbackQuery, state: FSMContext):
-    # Возврат к вопросу "добавить надпись?", не сбрасывая pending_amount
     data = await state.get_data()
     await state.set_state(None)
     await state.set_data(data)
@@ -1171,7 +1220,7 @@ async def gift_ask_no_handler(callback: types.CallbackQuery, state: FSMContext):
 async def gift_text_input_handler(message: types.Message, state: FSMContext):
     if message.text in MENU_BUTTONS:
         await state.clear()
-        return  # обработает guard_menu_buttons
+        return
 
     gift_text = (message.text or "").strip()
     if not gift_text:
@@ -1184,7 +1233,6 @@ async def gift_text_input_handler(message: types.Message, state: FSMContext):
     await finalize_withdraw(message, state, gift_text)
 
 async def finalize_withdraw(event, state: FSMContext, gift_text: str | None):
-    """event может быть types.CallbackQuery (пропуск надписи) или types.Message (ввод текста надписи)."""
     data = await state.get_data()
     amount = data.get("pending_amount")
     user_id = event.from_user.id
@@ -1246,12 +1294,13 @@ async def finalize_withdraw(event, state: FSMContext, gift_text: str | None):
     bot_link = f"https://t.me/{clean_bot_username}"
     bot_link_esc = escape_md(bot_link)
 
+    gift_emoji = "🧸" if amount <= 15 else ("🎁" if amount <= 25 else ("🚀" if amount <= 50 else "🏆"))
+
     request_log = (
         "🧾 *Новая заявка\\!*\n\n"
         f"👤 {user_mention_esc}\n"
-        f"⏳ {amount_esc} ⭐ ожидает подтверждения"
-        f"{gift_text_line}\n\n"
-        f"[{escape_md(BOT_USERNAME)}]({bot_link_esc})"
+        f"⏳ {amount_esc} {gift_emoji} ожидает подтверждения"
+        f"\n\n[{escape_md(BOT_USERNAME)}]({bot_link_esc})"
     )
     await send_log(request_log)
 
@@ -1318,24 +1367,22 @@ async def withdraw_approve_handler(callback: types.CallbackQuery):
     clean_bot_username = BOT_USERNAME.replace("@", "")
     bot_link = f"https://t.me/{clean_bot_username}"
     bot_link_esc = escape_md(bot_link)
-    gift_log_line = f"\n✍️ Надпись: _{escape_md(gift_text)}_" if gift_text else ""
+    
+    gift_emoji = "🧸" if amt <= 15 else ("🎁" if amt <= 25 else ("🚀" if amt <= 50 else "🏆"))
 
     payout_log = (
         "🧾 *Новая выплата\\!*\n\n"
         f"👤 {user_mention_esc}\n"
-        f"✅ {amt_esc} ⭐ успешно выведено"
-        f"{gift_log_line}\n\n"
-        f"[{escape_md(BOT_USERNAME)}]({bot_link_esc})"
+        f"✅ {amt_esc} {gift_emoji} успешно выведено"
+        f"\n\n[{escape_md(BOT_USERNAME)}]({bot_link_esc})"
     )
     await send_log(payout_log)
 
-    gift_status_line = f"\n✍️ Надпись: _{escape_md(gift_text)}_" if gift_text else ""
     status_admin_msg = (
         "💸 *Новая заявка на вывод\\!*\n\n"
         f"🆔 Заявка: \\#{w_id}\n"
         f"👤 Пользователь: {user_mention_esc}\n"
-        f"💰 Сумма: *{amt_esc} ⭐*"
-        f"{gift_status_line}\n\n"
+        f"💰 Сумма: *{amt_esc} ⭐*\n\n"
         "✅ *СТАТУС: ВЫДАНО*"
     )
     await callback.message.edit_text(status_admin_msg)
@@ -1372,20 +1419,18 @@ async def withdraw_reject_handler(callback: types.CallbackQuery):
         await db.commit()
 
     try:
-        await bot.send_message(u_id, f"❌ Ваша заявка #{w_id} на {int(amt)} ⭐ была отклонена. Средства возвращены на баланс.", parse_mode=None)
+        await bot.send_message(u_id, f"❌ Ваша заявка на {int(amt)} ⭐ была отклонена. Звёзды возвращены на баланс.", parse_mode=None)
     except Exception: pass
 
     user_mention = f"@{u_name}" if u_name else f"ID: {u_id}"
     user_mention_esc = escape_md(user_mention)
     amt_esc = escape_md(str(int(amt)))
-    gift_status_line = f"\n✍️ Надпись: _{escape_md(gift_text)}_" if gift_text else ""
 
     status_admin_msg = (
         "💸 *Новая заявка на вывод\\!*\n\n"
         f"🆔 Заявка: \\#{w_id}\n"
         f"👤 Пользователь: {user_mention_esc}\n"
-        f"💰 Сумма: *{amt_esc} ⭐*"
-        f"{gift_status_line}\n\n"
+        f"💰 Сумма: *{amt_esc} ⭐*\n\n"
         "❌ *СТАТУС: ОТКЛОНЕНО*"
     )
     await callback.message.edit_text(status_admin_msg)
@@ -1399,7 +1444,6 @@ async def back_to_main_handler(callback: types.CallbackQuery, state: FSMContext)
     await show_start_screen(callback.message, callback.from_user)
     await callback.answer()
 
-# ==================== АДМИН-ПАНЕЛЬ ====================
 async def admin_panel(message: types.Message, state: FSMContext):
     if not await is_admin(message.from_user.id):
         return
@@ -1416,7 +1460,16 @@ async def admin_panel(message: types.Message, state: FSMContext):
         + quote_block(f"👥 Пользователей: {total_users}\n⏳ Заявок в ожидании: {pending_withdraws}")
         + "\n\nВыберите раздел:"
     )
-    await message.answer(text, reply_markup=admin_keyboard(0))
+    builder = admin_keyboard(0)
+    builder.inline_keyboard.append([types.InlineKeyboardButton(text="← Назад", callback_data="admin_back_to_main")])
+    await message.answer(text, reply_markup=builder)
+
+@dp.callback_query(F.data == "admin_back_to_main")
+async def admin_back_to_main_callback(callback: types.CallbackQuery, state: FSMContext):
+    await state.clear()
+    await callback.message.delete()
+    await show_start_screen(callback.message, callback.from_user)
+    await callback.answer()
 
 @dp.callback_query(F.data == "admin_back_to_panel")
 async def admin_back_to_panel_handler(callback: types.CallbackQuery, state: FSMContext):
@@ -1432,18 +1485,22 @@ async def admin_back_to_panel_handler(callback: types.CallbackQuery, state: FSMC
         + quote_block(f"👥 Пользователей: {total_users}\n⏳ Заявок в ожидании: {pending_withdraws}")
         + "\n\nВыберите раздел:"
     )
+    builder = admin_keyboard(0)
+    builder.inline_keyboard.append([types.InlineKeyboardButton(text="← Назад", callback_data="admin_back_to_main")])
     try:
-        await callback.message.edit_text(text, reply_markup=admin_keyboard(0))
+        await callback.message.edit_text(text, reply_markup=builder)
     except Exception:
-        await callback.message.answer(text, reply_markup=admin_keyboard(0))
+        await callback.message.answer(text, reply_markup=builder)
     await callback.answer()
 
 @dp.callback_query(F.data.startswith("admin_page:"))
 async def admin_page_handler(callback: types.CallbackQuery):
     if not await is_admin(callback.from_user.id): return
     page = int(callback.data.split(":")[1])
+    builder = admin_keyboard(page)
+    builder.inline_keyboard.append([types.InlineKeyboardButton(text="← Назад", callback_data="admin_back_to_main")])
     try:
-        await callback.message.edit_reply_markup(reply_markup=admin_keyboard(page))
+        await callback.message.edit_reply_markup(reply_markup=builder)
     except Exception:
         pass
     await callback.answer()
@@ -1452,7 +1509,6 @@ async def admin_page_handler(callback: types.CallbackQuery):
 async def admin_page_noop_handler(callback: types.CallbackQuery):
     await callback.answer()
 
-# --- Топ: вкл/выкл ---
 @dp.callback_query(F.data == "admin_toggle_top")
 async def admin_toggle_top_handler(callback: types.CallbackQuery):
     if not await is_admin(callback.from_user.id): return
@@ -1463,18 +1519,6 @@ async def admin_toggle_top_handler(callback: types.CallbackQuery):
     status_text = "включена ✅" if new_value == "1" else "отключена ❌"
     await callback.answer(f"Кнопка топов теперь: {status_text}", show_alert=True)
 
-# --- Режим техобслуживания ---
-@dp.callback_query(F.data == "admin_toggle_maintenance")
-async def admin_toggle_maintenance_handler(callback: types.CallbackQuery):
-    if not await is_admin(callback.from_user.id): return
-    current = await is_maintenance_mode()
-    new_value = "0" if current else "1"
-    await set_setting("maintenance_mode", new_value)
-
-    status_text = "включён 🛠 (бот недоступен обычным юзерам)" if new_value == "1" else "выключен ✅ (бот работает для всех)"
-    await callback.answer(f"Режим техработ теперь: {status_text}", show_alert=True)
-
-# --- Статистика ---
 @dp.callback_query(F.data == "admin_stats")
 async def admin_stats_handler(callback: types.CallbackQuery):
     if not await is_admin(callback.from_user.id): return
@@ -1518,29 +1562,28 @@ async def admin_stats_handler(callback: types.CallbackQuery):
         + "\n\n*📢 Каналы и промокоды*\n"
         + quote_block(f"Каналов подключено: {total_channels}\nПромокодов создано: {total_promos}")
     )
-    await callback.message.answer(escape_md_preserve_formatting(stats_text))
+    
+    builder = InlineKeyboardBuilder()
+    builder.button(text="← Назад", callback_data="admin_back_to_panel")
+    await callback.message.answer(escape_md_preserve_formatting(stats_text), reply_markup=builder.as_markup())
     await callback.answer()
 
 def escape_md_preserve_formatting(text: str) -> str:
-    """Экранирует MarkdownV2-спецсимволы в динамических числах внутри уже собранного текста.
-    Так как здесь текст собирается из f-строк с точками/цифрами, экранируем финально
-    только 'опасные' одиночные символы, которые не являются частью нашей разметки (*_> и т.д. уже расставлены руками).
-    Простое решение: экранируем точки и дефисы внутри чисел построчно."""
-    # Экранируем точки в числах (например 12.34 -> 12\.34) и проценты/скобки, не трогая уже готовую разметку
     def esc_line(line: str) -> str:
-        # экранируем спецсимволы, которые не являются markdown-разметкой, добавленной нами вручную
         result = re.sub(r'(?<!\\)([.\-!()])', r'\\\1', line)
         return result
     lines = text.split("\n")
     return "\n".join(esc_line(l) for l in lines)
 
-# --- Баланс пользователя ---
 @dp.callback_query(F.data == "admin_change_balance")
 async def admin_change_balance_start(callback: types.CallbackQuery, state: FSMContext):
     if not await is_admin(callback.from_user.id): return
+    builder = InlineKeyboardBuilder()
+    builder.button(text="← Назад", callback_data="admin_back_to_panel")
     await callback.message.answer(
         "👤 *Введите ID или @username пользователя для изменения баланса:*\n\n"
-        + quote_block("Пользователь должен хотя бы раз запустить бота \\(/start\\), иначе он не будет найден в базе\\.")
+        + quote_block("Пользователь должен хотя бы раз запустить бота \\(/start\\), иначе он не будет найден в базе\\."),
+        reply_markup=builder.as_markup()
     )
     await state.set_state(AdminStates.waiting_for_balance_user)
     await callback.answer()
@@ -1577,7 +1620,6 @@ async def admin_change_balance_user(message: types.Message, state: FSMContext):
             "Убедитесь, что он хотя бы раз запускал бота \\(команда /start\\), и что username введён без опечаток\\.\n"
             "Попробуйте ввести ID или @username ещё раз:"
         )
-        # состояние НЕ сбрасываем, чтобы админ мог сразу ввести данные заново
         return
 
     user_info = f"@{escape_md(username)}" if username else f"ID: `{target_id}`"
@@ -1595,7 +1637,8 @@ async def admin_change_balance_user(message: types.Message, state: FSMContext):
     builder.button(text="➕ Прибавить", callback_data=f"bal_act:add:{target_id}")
     builder.button(text="➖ Отобрать", callback_data=f"bal_act:sub:{target_id}")
     builder.button(text="✏️ Изменить", callback_data=f"bal_act:set:{target_id}")
-    builder.adjust(3)
+    builder.button(text="← Назад", callback_data="admin_back_to_panel")
+    builder.adjust(3, 1)
 
     await message.answer(msg_text, reply_markup=builder.as_markup())
     await state.clear()
@@ -1613,7 +1656,9 @@ async def admin_balance_action(callback: types.CallbackQuery, state: FSMContext)
         "set": "✏️ *Введите новое точное значение баланса:*"
     }
 
-    await callback.message.answer(prompts[action])
+    builder = InlineKeyboardBuilder()
+    builder.button(text="← Назад", callback_data="admin_back_to_panel")
+    await callback.message.answer(prompts[action], reply_markup=builder.as_markup())
     await state.set_state(AdminStates.waiting_for_balance_value)
     await callback.answer()
 
@@ -1651,14 +1696,17 @@ async def admin_change_balance_value_process(message: types.Message, state: FSMC
             new_bal = (await c.fetchone())[0]
 
     bal_esc = escape_md(f"{new_bal:.2f}")
-    await message.answer(f"✅ *Баланс обновлён\!*\n\n👤 Пользователь: `{target_id}`\n💰 Новый баланс: `{bal_esc}` ⭐")
+    builder = InlineKeyboardBuilder()
+    builder.button(text="← Назад", callback_data="admin_back_to_panel")
+    await message.answer(f"✅ *Баланс обновлён\!*\n\n👤 Пользователь: `{target_id}`\n💰 Новый баланс: `{bal_esc}` ⭐", reply_markup=builder.as_markup())
     await state.clear()
 
-# --- Найти пользователя (полная карточка) ---
 @dp.callback_query(F.data == "admin_find_user")
 async def admin_find_user_start(callback: types.CallbackQuery, state: FSMContext):
     if not await is_admin(callback.from_user.id): return
-    await callback.message.answer("🔎 *Введите ID или @username пользователя для просмотра карточки:*")
+    builder = InlineKeyboardBuilder()
+    builder.button(text="← Назад", callback_data="admin_back_to_panel")
+    await callback.message.answer("🔎 *Введите ID или @username пользователя для просмотра карточки:*", reply_markup=builder.as_markup())
     await state.set_state(AdminStates.waiting_for_find_user)
     await callback.answer()
 
@@ -1716,10 +1764,11 @@ async def admin_find_user_process(message: types.Message, state: FSMContext):
             f"📅 Регистрация: {created_at}"
         )
     )
-    await message.answer(escape_md_preserve_formatting(card_text))
+    builder = InlineKeyboardBuilder()
+    builder.button(text="← Назад", callback_data="admin_back_to_panel")
+    await message.answer(escape_md_preserve_formatting(card_text), reply_markup=builder.as_markup())
     await state.clear()
 
-# --- Заявки на вывод ---
 @dp.callback_query(F.data.startswith("admin_pending_w_page:"))
 async def admin_pending_withdraws_page(callback: types.CallbackQuery):
     if not await is_admin(callback.from_user.id): return
@@ -1738,10 +1787,12 @@ async def admin_pending_withdraws_page(callback: types.CallbackQuery):
 
     if not withdraws:
         msg_text = "🎉 *Нет ожидающих заявок на вывод\.*"
+        builder = InlineKeyboardBuilder()
+        builder.button(text="← Назад", callback_data="admin_back_to_panel")
         if callback.message.text:
-            await callback.message.edit_text(msg_text)
+            await callback.message.edit_text(msg_text, reply_markup=builder.as_markup())
         else:
-            await callback.message.answer(msg_text)
+            await callback.message.answer(msg_text, reply_markup=builder.as_markup())
         await callback.answer()
         return
 
@@ -1777,21 +1828,87 @@ async def admin_pending_withdraws_page(callback: types.CallbackQuery):
 
     if nav_buttons:
         builder.row(*nav_buttons)
+    builder.row(types.InlineKeyboardButton(text="← Назад в панель", callback_data="admin_back_to_panel"))
 
     try:
-        await callback.message.edit_text(text, reply_markup=builder.as_markup() if nav_buttons else None)
+        await callback.message.edit_text(text, reply_markup=builder.as_markup())
     except Exception:
-        await callback.message.answer(text, reply_markup=builder.as_markup() if nav_buttons else None)
+        await callback.message.answer(text, reply_markup=builder.as_markup())
 
     await callback.answer()
 
-# --- Рассылка ---
+@dp.callback_query(F.data == "admin_sponsors_menu")
+async def admin_sponsors_menu_handler(callback: types.CallbackQuery):
+    if not await is_admin(callback.from_user.id): return
+    s1 = await get_setting("sponsor_1", "@StarPays_Reviews")
+    s2 = await get_setting("sponsor_2", "@StarPay_s")
+
+    text = (
+        "📢 *Управление обязательными спонсорами*\n\n"
+        + quote_block(f"Текущие каналы:\n1. {s1}\n2. {s2}")
+    )
+    builder = InlineKeyboardBuilder()
+    builder.button(text="✏️ Изменить Спонсора 1", callback_data="admin_set_sponsor_1")
+    builder.button(text="✏️ Изменить Спонсора 2", callback_data="admin_set_sponsor_2")
+    builder.button(text="← Назад", callback_data="admin_back_to_panel")
+    builder.adjust(1)
+    try:
+        await callback.message.edit_text(text, reply_markup=builder.as_markup())
+    except Exception:
+        await callback.message.answer(text, reply_markup=builder.as_markup())
+    await callback.answer()
+
+@dp.callback_query(F.data == "admin_set_sponsor_1")
+async def admin_set_sponsor_1_start(callback: types.CallbackQuery, state: FSMContext):
+    if not await is_admin(callback.from_user.id): return
+    builder = InlineKeyboardBuilder()
+    builder.button(text="← Назад", callback_data="admin_back_to_panel")
+    await callback.message.answer("📢 *Введите новый username или ID для Спонсора 1 (например @channel):*", reply_markup=builder.as_markup())
+    await state.set_state(AdminStates.waiting_for_sponsor_1)
+    await callback.answer()
+
+@dp.message(AdminStates.waiting_for_sponsor_1)
+async def admin_set_sponsor_1_process(message: types.Message, state: FSMContext):
+    if not await is_admin(message.from_user.id): return
+    if message.text in MENU_BUTTONS:
+        await state.clear()
+        return
+    val = message.text.strip()
+    await set_setting("sponsor_1", val)
+    builder = InlineKeyboardBuilder()
+    builder.button(text="← Назад", callback_data="admin_back_to_panel")
+    await message.answer(f"✅ *Спонсор 1 успешно изменен на `{escape_md(val)}`\!*", reply_markup=builder.as_markup())
+    await state.clear()
+
+@dp.callback_query(F.data == "admin_set_sponsor_2")
+async def admin_set_sponsor_2_start(callback: types.CallbackQuery, state: FSMContext):
+    if not await is_admin(callback.from_user.id): return
+    builder = InlineKeyboardBuilder()
+    builder.button(text="← Назад", callback_data="admin_back_to_panel")
+    await callback.message.answer("📢 *Введите новый username или ID для Спонсора 2 (например @channel):*", reply_markup=builder.as_markup())
+    await state.set_state(AdminStates.waiting_for_sponsor_2)
+    await callback.answer()
+
+@dp.message(AdminStates.waiting_for_sponsor_2)
+async def admin_set_sponsor_2_process(message: types.Message, state: FSMContext):
+    if not await is_admin(message.from_user.id): return
+    if message.text in MENU_BUTTONS:
+        await state.clear()
+        return
+    val = message.text.strip()
+    await set_setting("sponsor_2", val)
+    builder = InlineKeyboardBuilder()
+    builder.button(text="← Назад", callback_data="admin_back_to_panel")
+    await message.answer(f"✅ *Спонсор 2 успешно изменен на `{escape_md(val)}`\!*", reply_markup=builder.as_markup())
+    await state.clear()
+
 @dp.callback_query(F.data == "admin_broadcast")
 async def admin_broadcast_start(callback: types.CallbackQuery, state: FSMContext):
     if not await is_admin(callback.from_user.id): return
-
+    builder = InlineKeyboardBuilder()
+    builder.button(text="← Назад", callback_data="admin_back_to_panel")
     text = "📢 *Отправьте сообщение \(текст или фото\) для рассылки всем пользователям:*"
-    await callback.message.answer(text)
+    await callback.message.answer(text, reply_markup=builder.as_markup())
     await state.set_state(AdminStates.waiting_for_broadcast)
     await callback.answer()
 
@@ -1806,7 +1923,7 @@ async def admin_broadcast_process(message: types.Message, state: FSMContext):
         async with db.execute("SELECT user_id FROM users") as cursor:
             users = await cursor.fetchall()
 
-    await message.answer(f"🚀 *Рассылка запущена\.\.\.*\n👥 Получателей: *{len(users)}*")
+    await message.answer(f"🚀 *Рассылка запущена\.\.*\n👥 Получателей: *{len(users)}*")
     success = 0
     failed = 0
 
@@ -1822,7 +1939,6 @@ async def admin_broadcast_process(message: types.Message, state: FSMContext):
                 await asyncio.sleep(0.05)
                 break
             except TelegramRetryAfter as e:
-                logging.warning(f"Flood control, ждём {e.retry_after} сек")
                 await asyncio.sleep(e.retry_after)
                 continue
             except TelegramForbiddenError:
@@ -1832,26 +1948,30 @@ async def admin_broadcast_process(message: types.Message, state: FSMContext):
                 failed += 1
                 break
 
+    builder = InlineKeyboardBuilder()
+    builder.button(text="← Назад", callback_data="admin_back_to_panel")
     await message.answer(
         "✅ *Рассылка завершена\!*\n"
         "━━━━━━━━━━━━━━━━━━\n\n"
         f"🟢 Успешно: *{success}*\n"
-        f"🔴 Ошибок: *{failed}*"
+        f"🔴 Ошибок: *{failed}*",
+        reply_markup=builder.as_markup()
     )
     await state.clear()
 
-# --- Настройка рефки ---
 @dp.callback_query(F.data == "admin_set_ref_reward")
 async def admin_set_ref_reward_start(callback: types.CallbackQuery, state: FSMContext):
     if not await is_admin(callback.from_user.id): return
     cur_rew = await get_ref_reward()
     cur_esc = escape_md(str(cur_rew))
+    builder = InlineKeyboardBuilder()
+    builder.button(text="← Назад", callback_data="admin_back_to_panel")
     text = (
         "⚙️ *Настройка реферальной награды*\n\n"
         + quote_block(f"Текущая награда за друга: {cur_esc} ⭐")
         + "\n\nВведите новое количество звёзд за приглашенного друга:"
     )
-    await callback.message.answer(text)
+    await callback.message.answer(text, reply_markup=builder.as_markup())
     await state.set_state(AdminStates.waiting_for_ref_reward)
     await callback.answer()
 
@@ -1870,44 +1990,12 @@ async def admin_set_ref_reward_process(message: types.Message, state: FSMContext
         return
 
     await set_setting("ref_reward", str(val))
-
     val_esc = escape_md(str(val))
-    await message.answer(f"✅ *Награда за приглашенного друга изменена на `{val_esc}` ⭐\!*")
+    builder = InlineKeyboardBuilder()
+    builder.button(text="← Назад", callback_data="admin_back_to_panel")
+    await message.answer(f"✅ *Награда за приглашенного друга изменена на `{val_esc}` ⭐\!*", reply_markup=builder.as_markup())
     await state.clear()
 
-# --- Настройка минимальной суммы вывода ---
-@dp.callback_query(F.data == "admin_set_min_withdraw")
-async def admin_set_min_withdraw_start(callback: types.CallbackQuery, state: FSMContext):
-    if not await is_admin(callback.from_user.id): return
-    cur = await get_setting("min_withdraw", str(MIN_WITHDRAW))
-    text = (
-        "💳 *Настройка минимальной суммы вывода*\n\n"
-        + quote_block(f"Текущее значение: {cur} ⭐")
-        + "\n\nВведите новую минимальную сумму:"
-    )
-    await callback.message.answer(text)
-    await state.set_state(AdminStates.waiting_for_min_withdraw)
-    await callback.answer()
-
-@dp.message(AdminStates.waiting_for_min_withdraw)
-async def admin_set_min_withdraw_process(message: types.Message, state: FSMContext):
-    if not await is_admin(message.from_user.id): return
-    if message.text in MENU_BUTTONS:
-        await state.clear()
-        return
-    try:
-        val = float(message.text.replace(",", "."))
-        if val <= 0: raise ValueError()
-    except ValueError:
-        await message.answer("❌ Введите корректное положительное число.")
-        return
-
-    await set_setting("min_withdraw", str(val))
-    val_esc = escape_md(str(val))
-    await message.answer(f"✅ *Минимальная сумма вывода установлена: `{val_esc}` ⭐\!*")
-    await state.clear()
-
-# --- Настройка кнопки "Клик" ---
 @dp.callback_query(F.data == "admin_click_menu")
 async def admin_click_menu(callback: types.CallbackQuery, state: FSMContext):
     if not await is_admin(callback.from_user.id): return
@@ -1943,7 +2031,9 @@ async def click_toggle_handler(callback: types.CallbackQuery):
 @dp.callback_query(F.data == "click_set_reward")
 async def click_set_reward_start(callback: types.CallbackQuery, state: FSMContext):
     if not await is_admin(callback.from_user.id): return
-    await callback.message.answer("💰 *Введите новую награду за один клик \(в звёздах\):*")
+    builder = InlineKeyboardBuilder()
+    builder.button(text="← Назад", callback_data="admin_click_menu")
+    await callback.message.answer("💰 *Введите новую награду за один клик \(в звёздах\):*", reply_markup=builder.as_markup())
     await state.set_state(AdminStates.waiting_for_click_reward)
     await callback.answer()
 
@@ -1962,13 +2052,17 @@ async def click_set_reward_process(message: types.Message, state: FSMContext):
 
     await set_setting("click_reward", str(val))
     val_esc = escape_md(str(val))
-    await message.answer(f"✅ *Награда за клик изменена на `{val_esc}` ⭐\!*")
+    builder = InlineKeyboardBuilder()
+    builder.button(text="← Назад", callback_data="admin_click_menu")
+    await message.answer(f"✅ *Награда за клик изменена на `{val_esc}` ⭐\!*", reply_markup=builder.as_markup())
     await state.clear()
 
 @dp.callback_query(F.data == "click_set_cooldown")
 async def click_set_cooldown_start(callback: types.CallbackQuery, state: FSMContext):
     if not await is_admin(callback.from_user.id): return
-    await callback.message.answer("⏱ *Введите новый кулдаун между кликами \(в минутах\):*")
+    builder = InlineKeyboardBuilder()
+    builder.button(text="← Назад", callback_data="admin_click_menu")
+    await callback.message.answer("⏱ *Введите новый кулдаун между кликами \(в минутах\):*", reply_markup=builder.as_markup())
     await state.set_state(AdminStates.waiting_for_click_cooldown)
     await callback.answer()
 
@@ -1986,14 +2080,17 @@ async def click_set_cooldown_process(message: types.Message, state: FSMContext):
         return
 
     await set_setting("click_cooldown_min", str(val))
-    await message.answer(f"✅ *Кулдаун клика изменён на `{val}` мин\.\!*")
+    builder = InlineKeyboardBuilder()
+    builder.button(text="← Назад", callback_data="admin_click_menu")
+    await message.answer(f"✅ *Кулдаун клика изменён на `{val}` мин\.\!*", reply_markup=builder.as_markup())
     await state.clear()
 
-# --- Бан / разбан пользователя ---
 @dp.callback_query(F.data == "admin_ban_user")
 async def admin_ban_user_start(callback: types.CallbackQuery, state: FSMContext):
     if not await is_admin(callback.from_user.id): return
-    await callback.message.answer("🚫 *Введите ID или @username пользователя, которого нужно забанить:*")
+    builder = InlineKeyboardBuilder()
+    builder.button(text="← Назад", callback_data="admin_back_to_panel")
+    await callback.message.answer("🚫 *Введите ID или @username пользователя, которого нужно забанить:*", reply_markup=builder.as_markup())
     await state.set_state(AdminStates.waiting_for_ban_user)
     await callback.answer()
 
@@ -2029,26 +2126,27 @@ async def admin_ban_user_process(message: types.Message, state: FSMContext):
         await db.execute("UPDATE users SET is_banned = 1 WHERE user_id = ?", (target_id,))
         await db.commit()
 
-    await message.answer(f"✅ *Пользователь `{target_id}` заблокирован в боте\\!*")
+    builder = InlineKeyboardBuilder()
+    builder.button(text="← Назад", callback_data="admin_back_to_panel")
+    await message.answer(f"✅ *Пользователь `{target_id}` заблокирован в боте\\!*", reply_markup=builder.as_markup())
     await state.clear()
 
 @dp.callback_query(F.data == "admin_unban_user")
 async def admin_unban_user_start(callback: types.CallbackQuery, state: FSMContext):
     if not await is_admin(callback.from_user.id): return
-    await callback.message.answer("✅ *Введите ID или @username пользователя, которого нужно разбанить:*")
+    builder = InlineKeyboardBuilder()
+    builder.button(text="← Назад", callback_data="admin_back_to_panel")
+    await callback.message.answer("✅ *Введите ID или @username пользователя, которого нужно разбанить:*", reply_markup=builder.as_markup())
     await state.set_state(AdminStates.waiting_for_unban_user)
     await callback.answer()
 
 @dp.message(AdminStates.waiting_for_unban_user)
 async def admin_unban_user_process(message: types.Message, state: FSMContext):
-    if not await is_admin(message.from_user.id): return
+    if not await is_admin(callback.from_user.id): return
     if message.text in MENU_BUTTONS:
         await state.clear()
-        return
-
     text = (message.text or "").strip().lstrip("@")
     target_id = None
-
     async with aiosqlite.connect(DB_PATH) as db:
         if text.isdigit():
             async with db.execute("SELECT user_id FROM users WHERE user_id = ?", (int(text),)) as cursor:
@@ -2058,474 +2156,52 @@ async def admin_unban_user_process(message: types.Message, state: FSMContext):
             async with db.execute("SELECT user_id FROM users WHERE LOWER(username) = LOWER(?)", (text,)) as cursor:
                 row = await cursor.fetchone()
                 if row: target_id = row[0]
-
         if not target_id:
-            await message.answer("❌ Пользователь не найден\\! Попробуйте ещё раз:")
+            await message.answer("❌ Пользователь не найден!")
             return
-
         await db.execute("UPDATE users SET is_banned = 0 WHERE user_id = ?", (target_id,))
         await db.commit()
-
-    await message.answer(f"✅ *Пользователь `{target_id}` разблокирован\\!*")
-    await state.clear()
-
-# --- Добавление админа ---
-@dp.callback_query(F.data == "admin_add_admin")
-async def admin_add_admin_start(callback: types.CallbackQuery, state: FSMContext):
-    if not await is_admin(callback.from_user.id): return
-    msg = escape_md("👤 Пришлите @username или ID пользователя, которому хотите выдать админ-права:")
-    await callback.message.answer(f"*{msg}*")
-    await state.set_state(AdminStates.waiting_for_new_admin)
-    await callback.answer()
-
-@dp.message(AdminStates.waiting_for_new_admin)
-async def admin_add_admin_process(message: types.Message, state: FSMContext):
-    if not await is_admin(message.from_user.id): return
-    if message.text in MENU_BUTTONS:
-        await state.clear()
-        return
-
-    text = message.text.strip().replace("@", "")
-    target_id = None
-
-    if text.isdigit():
-        target_id = int(text)
-    else:
-        async with aiosqlite.connect(DB_PATH) as db:
-            async with db.execute("SELECT user_id FROM users WHERE LOWER(username) = LOWER(?)", (text,)) as cursor:
-                row = await cursor.fetchone()
-                if row: target_id = row[0]
-
-    if not target_id:
-        await message.answer("❌ Пользователь не найден в базе данных бота. Он должен хотя бы раз написать боту.")
-        return
-
-    async with aiosqlite.connect(DB_PATH) as db:
-        await db.execute("INSERT OR IGNORE INTO admins (user_id) VALUES (?)", (target_id,))
-        await db.commit()
-
-    await message.answer(f"✅ *Пользователю `{target_id}` успешно выданы права администратора\!*")
-    await state.clear()
-
-# --- Список админов ---
-@dp.callback_query(F.data == "admin_list_admins")
-async def admin_list_admins(callback: types.CallbackQuery):
-    if not await is_admin(callback.from_user.id): return
-
-    async with aiosqlite.connect(DB_PATH) as db:
-        async with db.execute("SELECT a.user_id, u.username FROM admins a LEFT JOIN users u ON a.user_id = u.user_id") as cursor:
-            admins = await cursor.fetchall()
-
-    if not admins:
-        await callback.message.answer("Список админов пуст.")
-        return
-
-    text = "👥 *Список администраторов*\n━━━━━━━━━━━━━━━━━━\n\n"
     builder = InlineKeyboardBuilder()
-
-    for adm_id, username in admins:
-        u_str = f"@{escape_md(username)}" if username else "Без юзернейма"
-        adm_id_esc = escape_md(str(adm_id))
-
-        if adm_id == PRIMARY_ADMIN_ID:
-            text += f"👑 {u_str} \(ID: `{adm_id_esc}`\) — *Главный админ*\n"
-        else:
-            text += f"👤 {u_str} \(ID: `{adm_id_esc}`\)\n"
-            builder.button(text=f"❌ Снять ID {adm_id}", callback_data=f"remove_admin:{adm_id}")
-
-    builder.adjust(1)
-    await callback.message.answer(text, reply_markup=builder.as_markup())
-    await callback.answer()
-
-@dp.callback_query(F.data.startswith("remove_admin:"))
-async def remove_admin_handler(callback: types.CallbackQuery):
-    if not await is_admin(callback.from_user.id): return
-    target_id = int(callback.data.split(":")[1])
-
-    if target_id == PRIMARY_ADMIN_ID:
-        await callback.answer("❌ Нельзя снять главного администратора!", show_alert=True)
-        return
-
-    async with aiosqlite.connect(DB_PATH) as db:
-        await db.execute("DELETE FROM admins WHERE user_id = ?", (target_id,))
-        await db.commit()
-
-    await callback.answer("Администратор удалён!", show_alert=True)
-    await callback.message.edit_text(f"✅ *Пользователь `{target_id}` был лишён админ\-прав\.*")
-
-# --- Топ пользователей (админ) ---
-@dp.callback_query(F.data == "admin_top_users")
-async def admin_top_users(callback: types.CallbackQuery):
-    if not await is_admin(callback.from_user.id): return
-
-    async with aiosqlite.connect(DB_PATH) as db:
-        async with db.execute("SELECT user_id, username, balance FROM users ORDER BY balance DESC LIMIT 10") as cursor:
-            top_users = await cursor.fetchall()
-
-    if not top_users:
-        await callback.message.answer("Список пользователей пуст.")
-        return
-
-    medals = ["🥇", "🥈", "🥉"]
-    lines = []
-    for idx, (u_id, u_name, bal) in enumerate(top_users, start=1):
-        username_str = f"@{escape_md(u_name)}" if u_name else "Без юзернейма"
-        id_str = escape_md(str(u_id))
-        bal_esc = escape_md(f"{bal:.2f}")
-        prefix = medals[idx - 1] if idx <= 3 else f"*{idx}\.*"
-        lines.append(f"{prefix} {username_str} \(ID: `{id_str}`\) — *{bal_esc}* ⭐")
-
-    text = "🏆 *ТОП\-10 Пользователей по звёздам*\n━━━━━━━━━━━━━━━━━━\n\n" + quote_block("\n".join(lines))
-    await callback.message.answer(text)
-    await callback.answer()
-
-# --- Промокоды: меню ---
-@dp.callback_query(F.data == "admin_promo_menu")
-async def admin_promo_menu(callback: types.CallbackQuery, state: FSMContext):
-    if not await is_admin(callback.from_user.id): return
-    await state.clear()
-    text = "🎟 *Управление промокодами*\n\nВыберите действие:"
-    try:
-        await callback.message.edit_text(text, reply_markup=promo_menu_keyboard())
-    except Exception:
-        await callback.message.answer(text, reply_markup=promo_menu_keyboard())
-    await callback.answer()
-
-# --- Промокоды: создание ---
-@dp.callback_query(F.data == "promo_create_start")
-async def promo_create_start(callback: types.CallbackQuery, state: FSMContext):
-    if not await is_admin(callback.from_user.id): return
-    await callback.message.answer("🎟 *Введите название промокода* \(например: `NEWYEAR2026`\):")
-    await state.set_state(AdminStates.waiting_for_promo_code)
-    await callback.answer()
-
-@dp.message(AdminStates.waiting_for_promo_code)
-async def promo_create_code_process(message: types.Message, state: FSMContext):
-    if not await is_admin(message.from_user.id): return
-    if message.text in MENU_BUTTONS:
-        await state.clear()
-        return
-
-    code = message.text.strip().upper()
-    if not code or " " in code:
-        await message.answer("❌ Промокод не должен содержать пробелов. Введите ещё раз:")
-        return
-
-    async with aiosqlite.connect(DB_PATH) as db:
-        async with db.execute("SELECT 1 FROM promocodes WHERE code = ?", (code,)) as cursor:
-            exists = await cursor.fetchone() is not None
-
-    if exists:
-        await message.answer("❌ Такой промокод уже существует\\! Введите другое название:")
-        return
-
-    await state.update_data(new_promo_code=code)
-    await message.answer("💰 *Сколько звёзд будет начисляться за активацию?*")
-    await state.set_state(AdminStates.waiting_for_promo_amount)
-
-@dp.message(AdminStates.waiting_for_promo_amount)
-async def promo_create_amount_process(message: types.Message, state: FSMContext):
-    if not await is_admin(message.from_user.id): return
-    if message.text in MENU_BUTTONS:
-        await state.clear()
-        return
-
-    try:
-        amount = float(message.text.replace(",", "."))
-        if amount <= 0: raise ValueError()
-    except ValueError:
-        await message.answer("❌ Введите корректное положительное число.")
-        return
-
-    await state.update_data(new_promo_amount=amount)
-    await message.answer(
-        "🔢 *Сколько раз можно активировать этот промокод?*\n\n"
-        "Введите число, либо `0` для безлимитных активаций\."
-    )
-    await state.set_state(AdminStates.waiting_for_promo_limit)
-
-@dp.message(AdminStates.waiting_for_promo_limit)
-async def promo_create_limit_process(message: types.Message, state: FSMContext):
-    if not await is_admin(message.from_user.id): return
-    if message.text in MENU_BUTTONS:
-        await state.clear()
-        return
-
-    try:
-        limit = int(message.text.strip())
-        if limit < 0: raise ValueError()
-    except ValueError:
-        await message.answer("❌ Введите целое число (0 или больше).")
-        return
-
-    data = await state.get_data()
-    code = data.get("new_promo_code")
-    amount = data.get("new_promo_amount")
-    max_activations = None if limit == 0 else limit
-
-    async with aiosqlite.connect(DB_PATH) as db:
-        await db.execute(
-            "INSERT INTO promocodes (code, amount, max_activations) VALUES (?, ?, ?)",
-            (code, amount, max_activations)
-        )
-        await db.commit()
-
-    amount_esc = escape_md(str(amount))
-    limit_text = "Безлимит ♾️" if max_activations is None else str(max_activations)
-    limit_esc = escape_md(limit_text)
-    code_esc = escape_md(code)
-
-    await message.answer(
-        "✅ *Промокод создан\!*\n\n"
-        f"🎟 Код: `{code_esc}`\n"
-        f"💰 Начисление: *{amount_esc}* ⭐\n"
-        f"🔢 Лимит активаций: *{limit_esc}*"
-    )
+    builder.button(text="← Назад", callback_data="admin_back_to_panel")
+    await message.answer(f"✅ *Пользователь `{target_id}` разблокирован\!*", reply_markup=builder.as_markup())
     await state.clear()
 
-# --- Промокоды: список ---
-@dp.callback_query(F.data == "promo_list")
-async def promo_list_handler(callback: types.CallbackQuery):
-    if not await is_admin(callback.from_user.id): return
+async def daily_mailing_scheduler():
+    while True:
+        now = datetime.now()
+        target = now.replace(hour=10, minute=0, second=0, microsecond=0)
+        if now >= target:
+            target += timedelta(days=1)
+        wait_seconds = (target - now).total_seconds()
+        await asyncio.sleep(wait_seconds)
 
-    async with aiosqlite.connect(DB_PATH) as db:
-        async with db.execute(
-            "SELECT code, amount, max_activations, used_activations FROM promocodes ORDER BY created_at DESC"
-        ) as cursor:
-            promos = await cursor.fetchall()
-
-    if not promos:
-        text = "📋 *Промокодов пока нет\.*"
-        builder = InlineKeyboardBuilder()
-        builder.button(text="← Назад", callback_data="admin_promo_menu")
         try:
-            await callback.message.edit_text(text, reply_markup=builder.as_markup())
-        except Exception:
-            await callback.message.answer(text, reply_markup=builder.as_markup())
-        await callback.answer()
-        return
+            async with aiosqlite.connect(DB_PATH) as db:
+                async with db.execute("SELECT user_id FROM users WHERE is_banned = 0") as cursor:
+                    users = await cursor.fetchall()
+            for u in users:
+                try:
+                    builder = InlineKeyboardBuilder()
+                    builder.button(text="✨ Начать фармить", url=f"https://t.me/{BOT_USERNAME.replace('@', '')}?start=farming")
+                    builder.adjust(1)
+                    await bot.send_message(
+                        chat_id=u[0],
+                        text="*Ежедневный бонус ждет вас\! Нажмите кнопку ниже, чтобы начать фармить звёзды\.*",
+                        reply_markup=builder.as_markup(),
+                        parse_mode=ParseMode.MARKDOWN_V2
+                    )
+                    await asyncio.sleep(0.05)
+                except Exception:
+                    pass
+        except Exception as e:
+            logging.error(f"Ошибка ежедневной рассылки: {e}")
 
-    text_lines = ["🎟 *Список промокодов*", "━━━━━━━━━━━━━━━━━━\n"]
-    builder = InlineKeyboardBuilder()
-
-    for code, amount, max_act, used_act in promos:
-        code_esc = escape_md(code)
-        amount_esc = escape_md(str(amount))
-        limit_text = "♾️" if max_act is None else f"{used_act}/{max_act}"
-        limit_esc = escape_md(limit_text)
-        text_lines.append(f"🎟 `{code_esc}` — *{amount_esc}* ⭐ \(исп\.: {limit_esc}\)")
-        builder.button(text=f"❌ Удалить {code}", callback_data=f"promo_delete:{code}")
-
-    builder.button(text="← Назад", callback_data="admin_promo_menu")
-    builder.adjust(1)
-
-    text = "\n".join(text_lines)
-    try:
-        await callback.message.edit_text(text, reply_markup=builder.as_markup())
-    except Exception:
-        await callback.message.answer(text, reply_markup=builder.as_markup())
-    await callback.answer()
-
-@dp.callback_query(F.data.startswith("promo_delete:"))
-async def promo_delete_handler(callback: types.CallbackQuery):
-    if not await is_admin(callback.from_user.id): return
-    code = callback.data.split(":", 1)[1]
-
-    async with aiosqlite.connect(DB_PATH) as db:
-        await db.execute("DELETE FROM promocodes WHERE code = ?", (code,))
-        await db.execute("DELETE FROM promo_activations WHERE promo_code = ?", (code,))
-        await db.commit()
-
-    await callback.answer(f"Промокод {code} удалён!", show_alert=True)
-    await promo_list_handler(callback)
-
-# --- Создание чека ---
-@dp.callback_query(F.data == "admin_create_check")
-async def admin_create_check_start(callback: types.CallbackQuery, state: FSMContext):
-    if not await is_admin(callback.from_user.id): return
-    await callback.message.answer("🎟 *Введите количество звёзд для чека:*")
-    await state.set_state(AdminStates.waiting_for_check_amount)
-    await callback.answer()
-
-@dp.message(AdminStates.waiting_for_check_amount)
-async def admin_create_check_process(message: types.Message, state: FSMContext):
-    if not await is_admin(message.from_user.id): return
-    if message.text in MENU_BUTTONS:
-        await state.clear()
-        return
-
-    try:
-        amount = float(message.text.replace(",", "."))
-        if amount <= 0: raise ValueError()
-    except ValueError:
-        await message.answer("❌ Введите корректное число звезд.")
-        return
-
-    check_code = secrets.token_hex(4)
-    creator_id = message.from_user.id
-    welcome_photo = None
-
-    async with aiosqlite.connect(DB_PATH) as db:
-        async with db.execute("SELECT value FROM settings WHERE key = 'welcome_photo'") as cursor:
-            row = await cursor.fetchone()
-            if row: welcome_photo = row[0]
-
-    bot_info = await bot.get_me()
-    check_link = f"https://t.me/{bot_info.username}?start=check_{check_code}"
-
-    amount_val = int(amount) if amount.is_integer() else amount
-    amount_esc = escape_md(f"{amount_val}")
-    caption_text = f"🧸 *Чек на `{amount_esc}` Telegram Stars*"
-
-    builder = InlineKeyboardBuilder()
-    builder.button(text="🎁 Получить", url=check_link)
-
-    sent_msg = None
-    if welcome_photo:
-        try:
-            sent_msg = await message.answer_photo(
-                photo=welcome_photo,
-                caption=caption_text,
-                reply_markup=builder.as_markup()
-            )
-        except Exception:
-            sent_msg = await message.answer(caption_text, reply_markup=builder.as_markup())
-    else:
-        sent_msg = await message.answer(caption_text, reply_markup=builder.as_markup())
-
-    async with aiosqlite.connect(DB_PATH) as db:
-        await db.execute(
-            "INSERT INTO checks (code, creator_id, amount, chat_id, msg_id) VALUES (?, ?, ?, ?, ?)",
-            (check_code, creator_id, amount, sent_msg.chat.id if sent_msg else None, sent_msg.message_id if sent_msg else None)
-        )
-        await db.commit()
-
-    await state.clear()
-
-# --- Фоновое фото ---
-@dp.callback_query(F.data == "admin_set_photo")
-async def admin_set_photo_start(callback: types.CallbackQuery, state: FSMContext):
-    if not await is_admin(callback.from_user.id): return
-    await callback.message.answer("📸 *Отправьте изображение*, которое будет отображаться на баннере бота и на чеках\.")
-    await state.set_state(AdminStates.waiting_for_welcome_photo)
-
-@dp.message(AdminStates.waiting_for_welcome_photo, F.photo)
-async def admin_set_photo_process(message: types.Message, state: FSMContext):
-    if not await is_admin(message.from_user.id): return
-    photo_id = message.photo[-1].file_id
-    async with aiosqlite.connect(DB_PATH) as db:
-        await db.execute("INSERT OR REPLACE INTO settings (key, value) VALUES ('welcome_photo', ?)", (photo_id,))
-        await db.commit()
-    await message.answer("✅ *Фото баннера и чеков успешно обновлено\!*")
-    await state.clear()
-
-# --- Канал ---
-@dp.callback_query(F.data == "admin_add_channel")
-async def add_channel_start(callback: types.CallbackQuery, state: FSMContext):
-    if not await is_admin(callback.from_user.id): return
-    text = (
-        "➕ *Добавление канала*\n\n"
-        "Пришлите юзернейм канала \(например: `@mychannel`\) или его ID \(например: `-100123456789`\):\n\n"
-        "⚠️ *Важно:* Бот должен быть предварительно добавлен в этот канал в качестве *Администратора*\!"
-    )
-    await callback.message.answer(text)
-    await state.set_state(AdminStates.waiting_for_channel)
-
-@dp.message(AdminStates.waiting_for_channel)
-async def add_channel_process(message: types.Message, state: FSMContext):
-    if not await is_admin(message.from_user.id): return
-    if message.text in MENU_BUTTONS:
-        await state.clear()
-        return
-
-    input_text = message.text.strip()
-
-    if input_text.startswith("-100") or input_text.lstrip('-').isdigit():
-        chat_identifier = int(input_text)
-    else:
-        chat_identifier = input_text if input_text.startswith("@") else f"@{input_text}"
-
-    try:
-        chat = await bot.get_chat(chat_identifier)
-        ch_id = str(chat.id)
-        title = chat.title
-
-        if chat.username:
-            link = f"https://t.me/{chat.username}"
-        else:
-            link = f"https://t.me/c/{str(chat.id).replace('-100', '')}/1"
-
-        async with aiosqlite.connect(DB_PATH) as db:
-            await db.execute("INSERT INTO channels (channel_id, title, link) VALUES (?, ?, ?)", (ch_id, title, link))
-            await db.commit()
-
-        title_esc = escape_md(title)
-        link_esc = escape_md(link)
-        await message.answer(f"✅ *Канал успешно добавлен\!*\n📌 Название: {title_esc}\n🔗 Ссылка: {link_esc}")
-        await state.clear()
-    except Exception as e:
-        err_esc = escape_md(str(e))
-        await message.answer(f"❌ *Ошибка добавления\!*\n\nПричина: `{err_esc}`\n\nУбедитесь, что:\n1\. Бот добавлен в этот канал *Администратором*\.\n2\. Вы указали правильный `@username` или `ID` канала\.")
-
-@dp.callback_query(F.data == "admin_list_channels")
-async def list_channels(callback: types.CallbackQuery):
-    if not await is_admin(callback.from_user.id): return
-    async with aiosqlite.connect(DB_PATH) as db:
-        async with db.execute("SELECT id, title FROM channels") as cursor:
-            channels = await cursor.fetchall()
-
-    if not channels:
-        msg_text = "📋 *Список каналов пуст\.*"
-        if callback.message.text:
-            await callback.message.edit_text(msg_text)
-        else:
-            await callback.message.answer(msg_text)
-        await callback.answer()
-        return
-
-    text = f"📋 *Активные каналы* \(всего: {len(channels)}\)\n━━━━━━━━━━━━━━━━━━\n\n"
-    builder = InlineKeyboardBuilder()
-    for ch in channels:
-        ch_title_esc = escape_md(ch[1])
-        text += f"• \\#{ch[0]} — *{ch_title_esc}*\n"
-        builder.button(text=f"❌ Удалить #{ch[0]}", callback_data=f"del_ch:{ch[0]}")
-
-    builder.adjust(2)
-    try:
-        await callback.message.edit_text(text, reply_markup=builder.as_markup())
-    except Exception:
-        await callback.message.answer(text, reply_markup=builder.as_markup())
-    await callback.answer()
-
-@dp.callback_query(F.data.startswith("del_ch:"))
-async def delete_channel(callback: types.CallbackQuery):
-    if not await is_admin(callback.from_user.id): return
-    ch_db_id = callback.data.split(":")[1]
-    async with aiosqlite.connect(DB_PATH) as db:
-        await db.execute("DELETE FROM channels WHERE id = ?", (ch_db_id,))
-        await db.commit()
-
-    await callback.answer("Канал удалён!")
-    await callback.message.edit_text("✅ *Канал успешно удалён из системы\.*")
-
-# ==================== ЗАПУСК ====================
 async def main():
-    logging.info(f"Используется база данных: {DB_PATH}")
+    logging.basicConfig(level=logging.INFO)
     await init_db()
     asyncio.create_task(backup_db_loop())
-    while True:
-        try:
-            await dp.start_polling(bot)
-        except Exception as e:
-            logging.error(f"Критическая ошибка polling, перезапуск через 5 сек: {e}")
-            await asyncio.sleep(5)
-            continue
-        else:
-            break
+    asyncio.create_task(daily_mailing_scheduler())
+    await dp.start_polling(bot)
 
 if __name__ == "__main__":
-    logging.basicConfig(
-        level=logging.INFO,
-        format="%(asctime)s - %(levelname)s - %(message)s"
-    )
     asyncio.run(main())
