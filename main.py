@@ -5,7 +5,7 @@ from aiogram.filters import CommandStart
 from aiogram.types import Message
 
 # Замените на токен вашего бота от @BotFather
-TOKEN = "8834278881:AAEyZ0y2QjTTcZeUfmGLvGhkDqrP2bAiYoo"
+TOKEN = ""
 
 # Инициализация бота и диспетчера
 bot = Bot(token=TOKEN)
